@@ -1,0 +1,21 @@
+Synthetic-only baseline; seed=42
+Captures: train=135, test=45; windows per capture=4
+SNR: (-2.0, 14.0) dB; carrier offsets: (-0.008, 0.008) cycles/sample
+
+              precision    recall  f1-score   support
+
+       noise       1.00      1.00      1.00        64
+        BPSK       0.97      1.00      0.98        60
+        QPSK       1.00      0.96      0.98        56
+
+    accuracy                           0.99       180
+   macro avg       0.99      0.99      0.99       180
+weighted avg       0.99      0.99      0.99       180
+
+Accuracy on signal-only test windows by SNR:
+ -2 to  2 dB: 0.875 (16 samples)
+  2 to  6 dB: 1.000 (40 samples)
+  6 to 10 dB: 1.000 (32 samples)
+ 10 to 14 dB: 1.000 (28 samples)
+
+Noise false-alarm rate: 0.000
