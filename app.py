@@ -23,6 +23,15 @@ from signal_config import (
     SNR_DB_RANGE,
 )
 from spectrum_sense import extract_features, generate_capture, make_dataset
+from summaries import (
+    constellation_summary,
+    format_frequency,
+    format_sample_rate,
+    scores_summary,
+    spectrum_db,
+    spectrum_summary,
+    time_summary,
+)
 
 
 st.set_page_config(page_title="SpectrumSense Signal Lab", page_icon="📡", layout="wide")
@@ -30,6 +39,15 @@ st.set_page_config(page_title="SpectrumSense Signal Lab", page_icon="📡", layo
 # The browser-side check counts a megabyte as 1,000,000 bytes (1,048,576 on
 # Windows). Round up so the widget never rejects a file that a reader accepts.
 UPLOAD_WIDGET_MB = math.ceil(MAX_FILE_BYTES / 1_000_000)
+TIME_VIEW_SAMPLES = 128
+CONSTELLATION_STEP = 2
+EXAMPLE_WINDOWS = 2
+# Okabe-Ito blue and vermillion stay distinct with color-vision deficiency. On
+# Streamlit's light (#FFFFFF) and dark (#0E1117) backgrounds their contrast is
+# 5.2:1 and 3.6:1 (blue) and 3.9:1 and 4.9:1 (vermillion), above the 3:1 that
+# WCAG asks of graphics.
+BLUE = "#0072B2"
+VERMILLION = "#D55E00"
 
 
 @st.cache_resource(show_spinner="Training the synthetic baseline…")
@@ -61,62 +79,68 @@ def parse_upload(files: tuple[tuple[str, bytes], ...]) -> Recording:
     return load_uploads(files)
 
 
-SI_SCALES = ((1e9, "G", "billion"), (1e6, "M", "million"), (1e3, "k", "thousand"))
+@st.cache_data(show_spinner=False)
+def example_csv() -> str:
+    """A fixed simulated BPSK recording that the upload tab always accepts."""
+    capture, _, _ = generate_capture("BPSK", np.random.default_rng(2024), windows=EXAMPLE_WINDOWS)
+    return to_csv(capture.ravel())
 
 
-def format_frequency(hertz: float) -> str:
-    """Readable frequency such as 433.92 MHz."""
-    for scale, prefix, _ in SI_SCALES:
-        if abs(hertz) >= scale:
-            return f"{hertz / scale:.6g} {prefix}Hz"
-    return f"{hertz:.6g} Hz"
-
-
-def format_sample_rate(rate: float) -> str:
-    """Readable rate such as 2.4 million samples per second."""
-    for scale, _, word in SI_SCALES:
-        if rate >= scale:
-            return f"{rate / scale:.6g} {word} samples per second"
-    return f"{rate:.6g} samples per second"
-
-
-def signal_plots(samples: np.ndarray, section: str) -> None:
-    """Hoverable, zoomable time, constellation, and frequency views."""
-    time_axis = np.arange(128)
+def signal_plots(
+    samples: np.ndarray,
+    section: str,
+    sample_rate: float | None = None,
+    center_frequency: float | None = None,
+) -> None:
+    """Hoverable, zoomable time, constellation, and frequency views, each with a
+    text summary directly underneath. I and Q differ in line style, not only color."""
+    shown = samples[:TIME_VIEW_SAMPLES]
+    time_axis = np.arange(len(shown))
     time_plot = go.Figure()
-    time_plot.add_trace(go.Scatter(x=time_axis, y=samples.real[:128], name="I"))
-    time_plot.add_trace(go.Scatter(x=time_axis, y=samples.imag[:128], name="Q"))
-    time_plot.update_layout(title="I and Q over time", xaxis_title="Sample", yaxis_title="Amplitude", height=300)
+    time_plot.add_trace(
+        go.Scatter(x=time_axis, y=shown.real, name="I", line=dict(color=BLUE, width=2))
+    )
+    time_plot.add_trace(
+        go.Scatter(
+            x=time_axis, y=shown.imag, name="Q", line=dict(color=VERMILLION, width=2, dash="dash")
+        )
+    )
+    time_plot.update_layout(
+        title="I (solid) and Q (dashed) over time", xaxis_title="Sample",
+        yaxis_title="Amplitude", height=300,
+    )
 
-    points = samples[::2]
+    points = samples[::CONSTELLATION_STEP]
+    # A translucent fill (BLUE at 35% opacity) shows where points pile up; the
+    # solid outline keeps every point visible on light and dark backgrounds.
     constellation = go.Figure(
-        go.Scattergl(x=points.real, y=points.imag, mode="markers", marker=dict(size=5, opacity=0.5))
+        go.Scattergl(
+            x=points.real, y=points.imag, mode="markers",
+            marker=dict(size=6, color="rgba(0, 114, 178, 0.35)", line=dict(color=BLUE, width=1)),
+        )
     )
     constellation.update_layout(
         title="I/Q plane", xaxis_title="I", yaxis_title="Q", height=300,
         xaxis=dict(scaleanchor="y", scaleratio=1),
     )
 
-    frequencies = np.fft.fftshift(np.fft.fftfreq(len(samples)))
-    # Scale before the FFT, then restore the original magnitude in log space.
-    # Keep the noise floor positive even for zero or subnormal input samples.
-    fft_scale = max(1.0, np.max(np.abs(samples.real)), np.max(np.abs(samples.imag)))
-    fft_samples = np.empty_like(samples)
-    fft_samples.real = samples.real / fft_scale
-    fft_samples.imag = samples.imag / fft_scale
-    magnitude = np.abs(np.fft.fftshift(np.fft.fft(fft_samples)))
-    spectrum = 20 * (np.log10(magnitude + 1e-8 / fft_scale) + np.log10(fft_scale))
-    fft_plot = go.Figure(go.Scatter(x=frequencies, y=spectrum, mode="lines"))
+    frequencies, levels = spectrum_db(samples)
+    fft_plot = go.Figure(
+        go.Scatter(x=frequencies, y=levels, mode="lines", line=dict(color=BLUE, width=1.5))
+    )
     fft_plot.update_layout(
         title="FFT magnitude", xaxis_title="Cycles per sample", yaxis_title="Magnitude (dB)", height=300
     )
 
     st.plotly_chart(time_plot, key=f"{section}-time")
+    st.caption(time_summary(samples, TIME_VIEW_SAMPLES))
     left, right = st.columns(2)
     with left:
         st.plotly_chart(constellation, key=f"{section}-constellation")
+        st.caption(constellation_summary(samples, CONSTELLATION_STEP))
     with right:
         st.plotly_chart(fft_plot, key=f"{section}-fft")
+        st.caption(spectrum_summary(samples, sample_rate, center_frequency))
 
 
 def show_prediction(model, samples: np.ndarray, section: str) -> str:
@@ -125,21 +149,28 @@ def show_prediction(model, samples: np.ndarray, section: str) -> str:
     scores = model.predict_proba(features)[0]
     st.metric("Demo model prediction", predicted)
     score_plot = go.Figure(
-        go.Bar(x=model.classes_, y=scores, marker_color=["#466AE8", "#466AE8", "#466AE8"])
+        go.Bar(
+            x=model.classes_, y=scores, marker_color=BLUE,
+            text=[f"{score:.2f}" for score in scores], textposition="outside", cliponaxis=False,
+        )
     )
     score_plot.update_layout(
         title="Model scores for the three trained classes",
-        yaxis=dict(range=[0, 1], title="Score"),
+        # Headroom above 1 keeps the value printed on a full-height bar visible.
+        yaxis=dict(range=[0, 1.15], tickvals=[0, 0.25, 0.5, 0.75, 1], title="Score"),
         xaxis_title="Class",
         height=280,
     )
     st.plotly_chart(score_plot, key=f"{section}-scores")
-    st.caption("Scores are model outputs, not calibrated confidence or proof that an unknown signal belongs to a class.")
+    st.caption(
+        f"{scores_summary(model.classes_, scores)} Scores are model outputs, not calibrated "
+        "confidence or proof that an unknown signal belongs to a class."
+    )
     return predicted
 
 
 model, test_accuracy, train_captures, test_captures = get_demo_model()
-st.title("📡 SpectrumSense Signal Lab")
+st.title("SpectrumSense Signal Lab")
 st.write("Explore a radio signal, then see how a small machine-learning baseline describes it.")
 st.warning(
     "Research demo: the model learned idealized simulated noise, BPSK, and QPSK. "
@@ -149,13 +180,25 @@ st.warning(
 lab_tab, upload_tab, about_tab = st.tabs(["Explore a signal", "Try your own recording", "How the model works"])
 
 with lab_tab:
-    st.subheader("Create a simulated recording")
+    st.header("Create a simulated recording")
     controls, explanation = st.columns([2, 3])
     with controls:
-        label = st.selectbox("Signal type", CLASSES, index=1)
-        snr = st.slider("Signal-to-noise ratio (dB)", -12.0, 20.0, 6.0, 1.0, disabled=(label == "noise"))
-        offset = st.slider("Carrier offset (cycles/sample)", -0.030, 0.030, 0.000, 0.001)
-        seed = st.number_input("Example seed", min_value=0, max_value=1_000_000, value=42, step=1)
+        label = st.selectbox(
+            "Signal type", CLASSES, index=1,
+            help="Noise alone, or random bits sent as two phases (BPSK) or four phases (QPSK).",
+        )
+        snr = st.slider(
+            "Signal-to-noise ratio (dB)", -12.0, 20.0, 6.0, 1.0, disabled=(label == "noise"),
+            help="How strong the signal is compared with the noise; it does not apply to noise alone.",
+        )
+        offset = st.slider(
+            "Carrier offset (cycles/sample)", -0.030, 0.030, 0.000, 0.001,
+            help="A frequency mismatch between transmitter and receiver that makes the I/Q points rotate.",
+        )
+        seed = st.number_input(
+            "Example seed", min_value=0, max_value=1_000_000, value=42, step=1,
+            help="The same seed always gives the same recording; change it for new random bits and noise.",
+        )
     with explanation:
         st.markdown(
             "**What the controls mean**\n\n"
@@ -182,15 +225,26 @@ with lab_tab:
         data=to_csv(selected_samples),
         file_name="spectrum_sense_example.csv",
         mime="text/csv",
+        help='Save these samples as a CSV file that you can upload in the "Try your own recording" tab.',
     )
 
 with upload_tab:
-    st.subheader("Explore your own I/Q recording")
+    st.header("Explore your own I/Q recording")
     st.write(
         f"Upload a recording with {SAMPLES_PER_WINDOW:,} to {MAX_SAMPLES:,} I/Q samples: "
         "a CSV, a raw SDR sample file, a NumPy array, or a SigMF recording. "
-        "You can try the CSV downloaded from the first tab. "
-        f"Every {SAMPLES_PER_WINDOW:,} samples are displayed as a separate window."
+        f"Every {SAMPLES_PER_WINDOW:,} samples are displayed as a separate window. "
+        "To start, download the example CSV below and upload it, or use the CSV from the first tab."
+    )
+    st.download_button(
+        "Download an example CSV",
+        data=example_csv(),
+        file_name="spectrum_sense_upload_example.csv",
+        mime="text/csv",
+        help=(
+            f"A simulated BPSK recording of {EXAMPLE_WINDOWS * SAMPLES_PER_WINDOW:,} samples "
+            f"({EXAMPLE_WINDOWS} windows) that is the same every time."
+        ),
     )
     with st.expander("Supported file formats"):
         st.markdown(
@@ -212,12 +266,19 @@ with upload_tab:
         type=list(SUPPORTED_EXTENSIONS),
         accept_multiple_files=True,
         max_upload_size=UPLOAD_WIDGET_MB,
+        help=(
+            "Choose one recording file, or both files of a SigMF recording; "
+            "the formats and limits are listed above."
+        ),
     )
     if uploads:
         try:
             loaded = parse_upload(tuple((upload.name, upload.getvalue()) for upload in uploads))
         except ValueError as exc:
-            st.error(str(exc))
+            st.error(
+                f"{exc}\n\nTip: the example from **Download an example CSV** above always "
+                "loads, so you can compare your file with it."
+            )
         else:
             values = loaded.samples
             details = [f"**Format:** {loaded.source_format}", f"**Samples:** {len(values):,}"]
@@ -230,7 +291,13 @@ with upload_tab:
             st.markdown(" · ".join(details))
             available = len(values) // SAMPLES_PER_WINDOW
             if available > 1:
-                window_number = st.slider("Window to inspect", 1, available, 1)
+                window_number = st.slider(
+                    "Window to inspect", 1, available, 1,
+                    help=(
+                        f"Each window is {SAMPLES_PER_WINDOW:,} consecutive samples; "
+                        "choose one to plot and score."
+                    ),
+                )
             else:
                 window_number = 1
             start = (window_number - 1) * SAMPLES_PER_WINDOW
@@ -246,10 +313,10 @@ with upload_tab:
                 show_prediction(model, window, "uploaded")
             except ValueError as exc:
                 st.error(str(exc))
-            signal_plots(window, "uploaded")
+            signal_plots(window, "uploaded", loaded.sample_rate, loaded.center_frequency)
 
 with about_tab:
-    st.subheader("What you are testing")
+    st.header("What you are testing")
     a, b, c = st.columns(3)
     a.metric("Training captures", train_captures)
     b.metric("Held-out captures", test_captures)

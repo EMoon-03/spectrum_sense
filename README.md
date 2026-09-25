@@ -29,9 +29,17 @@ The app has three tabs:
   example as a CSV.
 - **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
   samples (see the formats below) and inspect any complete 1,024-sample
-  window. The downloaded demo CSV works here as a first example.
+  window. The tab offers a fixed example CSV to download and upload as a first
+  try; the CSV from the first tab works too.
 - **How the model works:** inspect its grouped test accuracy and learn what the
   synthetic score does and does not establish.
+
+Each chart has a one- or two-sentence text summary directly below it with the
+numbers it shows, such as the model scores, the RMS of I and Q, and the
+strongest frequency bin. Score bars print their values, the Q line is dashed so
+I and Q never differ by color alone, the colors (Okabe-Ito blue and
+vermillion) stay distinct with color-vision deficiency, and every control has
+help text.
 
 ### Supported upload formats
 
@@ -75,8 +83,8 @@ With the dependencies installed, run:
 ```
 
 The tests cover CSV validation and limits, lossless float64 interchange, the
-raw SDR, NumPy, and SigMF readers, and feature extraction and app uploads for
-extreme amplitudes.
+raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
+extreme amplitudes, and the chart summaries and other accessibility features.
 
 ## Run the command-line baseline
 
