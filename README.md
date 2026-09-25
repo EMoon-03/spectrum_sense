@@ -27,18 +27,19 @@ The app has three tabs:
 - **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR, carrier offset,
   and random seed; inspect zoomable plots and the model scores. Download your
   example as a CSV.
-- **Try an I/Q CSV:** upload a UTF-8 CSV with columns `I,Q` and at least 1,024
-  numeric rows; inspect any complete 1,024-sample window. The downloaded demo
-  CSV works here as a first example. Uploads are capped at 2 MB.
+- **Try an I/Q CSV:** upload a UTF-8 CSV with columns `I,Q` and 1,024 to
+  100,000 numeric rows (at most 6 MB); inspect any complete 1,024-sample
+  window. The downloaded demo CSV works here as a first example.
 - **How the model works:** inspect its grouped test accuracy and learn what the
   synthetic score does and does not establish.
 
 CSV exports preserve the precision of the float64 I/Q components. These files
-can be larger than rounded exports; imports still allow at most 2 MB and
-100,000 samples. Invalid CSV syntax is reported with a line number. Feature
-extraction normalizes a copy of each window to avoid amplitude overflow and
-leaves the imported samples unchanged. All-zero windows can be plotted but
-cannot be classified.
+are larger than rounded exports: 100,000 samples take about 4.2 MB for typical
+app data and at most 5.1 MB, so the 6 MB import limit fits any full-length
+export. Blank lines are skipped, and invalid rows or CSV syntax are reported
+with their line number in the file. Feature extraction normalizes a copy of
+each window to avoid amplitude overflow and leaves the imported samples
+unchanged. All-zero windows can be plotted but cannot be classified.
 
 ## Run the regression tests
 

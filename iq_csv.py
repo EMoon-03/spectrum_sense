@@ -10,8 +10,18 @@ import numpy as np
 from signal_config import SAMPLES_PER_WINDOW
 
 
-MAX_UPLOAD_BYTES = 2_000_000
 MAX_SAMPLES = 100_000
+# A to_csv row is at most 51 bytes (two values like "-2.2250738585072014e-308",
+# a comma, and CRLF), so MAX_SAMPLES rows need at most about 5.1 MB.
+MAX_UPLOAD_BYTES = 6_000_000
+
+
+def format_size(size: int) -> str:
+    """Readable decimal size, rounded down so a limit is never overstated."""
+    for unit, scale in (("MB", 1_000_000), ("kB", 1_000)):
+        if size >= scale:
+            return f"{size * 10 // scale / 10:,.1f}".removesuffix(".0") + f" {unit}"
+    return f"{size:,} bytes"
 
 
 def to_csv(samples: np.ndarray) -> str:
@@ -23,10 +33,20 @@ def to_csv(samples: np.ndarray) -> str:
     return output.getvalue()
 
 
+def _is_blank(row: list[str]) -> bool:
+    return not "".join(row).strip()
+
+
 def from_csv(data: bytes) -> np.ndarray:
-    """Read a recording, reporting invalid input as a user-facing ValueError."""
+    """Read a recording, reporting invalid input as a user-facing ValueError.
+
+    Blank lines, including rows whose cells are all empty, are skipped.
+    """
     if len(data) > MAX_UPLOAD_BYTES:
-        raise ValueError("The CSV exceeds 2 MB. Export a shorter recording.")
+        raise ValueError(
+            f"The CSV exceeds the {format_size(MAX_UPLOAD_BYTES)} upload limit. "
+            f"Export a shorter recording (at most {MAX_SAMPLES:,} samples)."
+        )
     try:
         content = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -35,11 +55,13 @@ def from_csv(data: bytes) -> np.ndarray:
     reader = csv.reader(StringIO(content, newline=""), strict=True)
     values: list[complex] = []
     try:
-        header = next(reader, None)
+        header = next((row for row in reader if not _is_blank(row)), None)
         if header is None or [part.strip().lower() for part in header] != ["i", "q"]:
             raise ValueError("The CSV must start with two columns named I,Q.")
 
         for row in reader:
+            if _is_blank(row):
+                continue
             line_number = reader.line_num
             if len(row) != 2:
                 raise ValueError(f"Line {line_number}: expected exactly two numeric columns.")
@@ -51,7 +73,9 @@ def from_csv(data: bytes) -> np.ndarray:
                 raise ValueError(f"Line {line_number}: values must be finite.")
             values.append(complex(real, imaginary))
             if len(values) > MAX_SAMPLES:
-                raise ValueError(f"The CSV has more than {MAX_SAMPLES:,} samples.")
+                raise ValueError(
+                    f"The CSV has more than {MAX_SAMPLES:,} samples. Export a shorter recording."
+                )
     except csv.Error as exc:
         raise ValueError(f"Line {reader.line_num}: invalid CSV format ({exc}).") from exc
 

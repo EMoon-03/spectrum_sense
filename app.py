@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
@@ -11,7 +13,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from iq_csv import from_csv, to_csv
+from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, from_csv, to_csv
 from signal_config import (
     CLASSES,
     FREQ_OFFSET_RANGE,
@@ -23,6 +25,10 @@ from spectrum_sense import extract_features, generate_capture, make_dataset
 
 
 st.set_page_config(page_title="SpectrumSense Signal Lab", page_icon="📡", layout="wide")
+
+# The browser-side check counts a megabyte as 1,000,000 bytes (1,048,576 on
+# Windows). Round up so the widget never rejects a file that from_csv accepts.
+UPLOAD_WIDGET_MB = math.ceil(MAX_UPLOAD_BYTES / 1_000_000)
 
 
 @st.cache_resource(show_spinner="Training the synthetic baseline…")
@@ -161,11 +167,12 @@ with lab_tab:
 with upload_tab:
     st.subheader("Explore your own I/Q sample file")
     st.write(
-        "Upload a UTF-8 CSV with headers `I,Q` and at least 1,024 rows. "
+        f"Upload a UTF-8 CSV with headers `I,Q` and {SAMPLES_PER_WINDOW:,} to "
+        f"{MAX_SAMPLES:,} rows (at most {format_size(MAX_UPLOAD_BYTES)}). "
         "You can try the file downloaded from the first tab. "
-        "Every 1,024 samples are displayed as a separate window."
+        f"Every {SAMPLES_PER_WINDOW:,} samples are displayed as a separate window."
     )
-    uploaded = st.file_uploader("Choose an I/Q CSV", type=["csv"], max_upload_size=2)
+    uploaded = st.file_uploader("Choose an I/Q CSV", type=["csv"], max_upload_size=UPLOAD_WIDGET_MB)
     if uploaded is not None:
         try:
             values = parse_upload(uploaded.getvalue())
