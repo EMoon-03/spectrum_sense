@@ -14,14 +14,18 @@ from signal_config import (
     SAMPLES_PER_WINDOW,
     UNCERTAIN,
 )
+from spectrogram import FLOOR_DB, SEGMENT_LENGTH, Spectrogram, compute_spectrogram
 from spectrum_sense import Decision, decision_order, generate_capture
 from summaries import (
     MAX_LISTED_RUNS,
+    STEADY_LEVEL_DB,
     constellation_summary,
     decision_summary,
+    format_duration,
     format_frequency,
     format_sample_rate,
     scores_summary,
+    spectrogram_summary,
     spectrum_db,
     spectrum_summary,
     time_summary,
@@ -35,6 +39,11 @@ SMALLEST = float.fromhex("0x0.0000000000001p-1022")
 
 def tone(bin_index: int, n: int = SAMPLES_PER_WINDOW) -> np.ndarray:
     return np.exp(2j * np.pi * bin_index * np.arange(n) / n)
+
+
+def tone_at(cycles: float, n: int) -> np.ndarray:
+    """A unit tone at a frequency in cycles per sample."""
+    return np.exp(2j * np.pi * cycles * np.arange(n))
 
 
 def tone_over_flat_floor(bin_index: int, n: int = SAMPLES_PER_WINDOW) -> np.ndarray:
@@ -54,11 +63,14 @@ class SummaryTestCase(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+                spectrogram = compute_spectrogram(samples)
                 texts = [
                     time_summary(samples, 128),
                     constellation_summary(samples, 2),
                     spectrum_summary(samples),
                     spectrum_summary(samples, 2.4e6, 433.92e6),
+                    spectrogram_summary(spectrogram),
+                    spectrogram_summary(spectrogram, 2.4e6, 433.92e6),
                 ]
                 _, levels = spectrum_db(samples)
         self.assertTrue(np.isfinite(levels).all())
@@ -262,14 +274,172 @@ class SpectrumSummaryTests(SummaryTestCase):
         self.assertNotRegex(text.lower(), r"\b(nan|inf)\b")
 
 
+def hand_made_spectrogram(power, segments, segment_length: int = 8) -> Spectrogram:
+    """A spectrogram with chosen power, laid out as compute_spectrogram lays it out."""
+    segments = np.asarray(segments)
+    hop = segment_length // 2
+    first = np.concatenate([[0], np.cumsum(segments)[:-1]])
+    return Spectrogram(
+        frequencies=np.fft.fftshift(np.fft.fftfreq(segment_length)),
+        starts=first * hop,
+        stops=(first + segments - 1) * hop + segment_length,
+        segments=segments,
+        power=np.asarray(power, dtype=float),
+        segment_length=segment_length,
+        ignored_samples=0,
+    )
+
+
+def weighted_example() -> Spectrogram:
+    """Eight bins (index 5 is 0.125 and index 1 is -0.375 cycles per sample) in
+    three time steps of 3, 3, and 1 segments. Weighted by segments, bin 5
+    averages 0.2 and the median bin 0.002, exactly 20 dB apart; an unweighted
+    mean would pick bin 1 instead. The first step is the quietest (total 0.247)
+    and the last the loudest (total 1.014): 6.1 dB apart."""
+    common = np.full(8, 0.002)
+    first = common.copy()
+    first[5] = (1.4 - 0.002) / 6
+    last = common.copy()
+    last[1] = 1.0
+    return hand_made_spectrogram([first, first, last], [3, 3, 1])
+
+
+class SpectrogramSummaryTests(SummaryTestCase):
+    def summarize(self, spectrogram: Spectrogram, *metadata) -> str:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+                text = spectrogram_summary(spectrogram, *metadata)
+        self.assertNotRegex(text.lower(), r"\b(nan|inf)\b")
+        return text
+
+    def test_numbers_come_from_the_segment_weighted_average(self):
+        self.assertEqual(
+            self.summarize(weighted_example()),
+            "The spectrogram shows 8 frequency bins across and 3 time steps down; each "
+            "averages 3 overlapping 8-sample segments (the last averages 1). Averaged over "
+            "time, the strongest frequency is 0.125 cycles per sample, 20.0 dB above the "
+            "median bin. The overall level changes over time: the quietest time step, around "
+            "sample 8, is 6.1 dB below the loudest, around sample 28.",
+        )
+
+    def test_sample_rate_gives_hertz_and_times_and_center_gives_radio_frequency(self):
+        text = self.summarize(weighted_example(), 1000.0, 433.92e6)
+        self.assertIn(
+            "0.125 cycles per sample (125 Hz above the center of the recorded band, about "
+            "433.92 MHz), 20.0 dB above the median bin.",
+            text,
+        )
+        self.assertIn(
+            "the quietest time step, around 7.5 milliseconds, is 6.1 dB below the loudest, "
+            "around 27.5 milliseconds.",
+            text,
+        )
+
+    def test_unrepresentable_times_fall_back_to_sample_numbers(self):
+        text = self.summarize(weighted_example(), SMALLEST)
+        self.assertIn("around sample 8, is 6.1 dB below the loudest, around sample 28.", text)
+
+    def test_steady_tone(self):
+        self.assertEqual(
+            self.summarize(compute_spectrogram(tone_at(0.125, 4096))),
+            "The spectrogram shows 256 frequency bins across and 31 time steps down; each is "
+            "one 256-sample segment, overlapping the next by half. Averaged over time, the "
+            "strongest frequency is 0.125 cycles per sample, at least 80 dB above the median "
+            "bin. The overall level is steady over time: every time step is within 0.0 dB of "
+            "the loudest.",
+        )
+
+    def test_known_level_changes_are_located(self):
+        samples = tone_at(0.125, 4096)
+        samples[768:1024] *= 2  # One whole segment 6.0 dB louder...
+        samples[2048:2304] *= 0.1  # ...and one 20 dB quieter: 26.0 dB apart.
+        spectrogram = compute_spectrogram(samples)
+        self.assertIn(
+            "The overall level changes over time: the quietest time step, around sample "
+            "2,176, is 26.0 dB below the loudest, around sample 896.",
+            self.summarize(spectrogram),
+        )
+        text = self.summarize(spectrogram, 2e6)
+        self.assertIn("0.125 cycles per sample (250 kHz above the center", text)
+        self.assertIn(
+            "around 1.09 milliseconds, is 26.0 dB below the loudest, around 448 microseconds.",
+            text,
+        )
+
+    def test_steadiness_threshold_matches_the_printed_value(self):
+        for change, expected in (
+            (STEADY_LEVEL_DB - 0.06, "is steady over time: every time step is within 2.9 dB"),
+            (STEADY_LEVEL_DB - 0.04, "changes over time: the quietest time step, around "
+             "sample 8, is 3.0 dB below"),
+        ):
+            with self.subTest(change=change):
+                power = np.zeros((2, 8))
+                power[:, 0] = 1.0, 10 ** (-change / 10)
+                self.assertIn(expected, self.summarize(hand_made_spectrogram(power, [1, 1])))
+
+    def test_flat_spectrum_and_silence(self):
+        samples = np.zeros(SAMPLES_PER_WINDOW, dtype=complex)
+        samples[128] = 1  # Seen only by the first segment, in the middle of its window.
+        self.assertEqual(
+            self.summarize(compute_spectrogram(samples)),
+            "The spectrogram shows 256 frequency bins across and 7 time steps down; each is "
+            "one 256-sample segment, overlapping the next by half. Averaged over time, the "
+            "spectrum is flat; no bin is more than 0.1 dB above the median bin. The overall "
+            "level changes over time: the quietest time step, around sample 256, is at least "
+            "80 dB below the loudest, around sample 128.",
+        )
+
+    def test_all_zero_recording(self):
+        text = self.summarize(compute_spectrogram(np.zeros(2048, dtype=complex)))
+        self.assertTrue(text.startswith("The spectrogram shows 256 frequency bins across and 15"))
+        self.assertTrue(
+            text.endswith(
+                f"Every cell is at the {FLOOR_DB:g} dB floor because no segment holds any "
+                "power, for example because every sample is zero."
+            ),
+            text,
+        )
+
+    def test_samples_after_the_last_segment_are_mentioned(self):
+        text = self.summarize(compute_spectrogram(tone_at(0.125, 1100)))
+        self.assertIn("The last 76 samples, which do not fill a segment, are left out.", text)
+        self.assertNotIn("left out", self.summarize(compute_spectrogram(tone_at(0.125, 1024))))
+
+    def test_one_time_step_has_no_level_change(self):
+        text = self.summarize(compute_spectrogram(tone_at(0.125, SEGMENT_LENGTH)))
+        self.assertIn("1 time step down; each is one", text)
+        self.assertNotIn("overall level", text)
+
+    def test_summary_matches_the_plotted_levels(self):
+        rng = np.random.default_rng(8)
+        capture, _, _ = generate_capture("QPSK", rng, windows=4, freq_offset_override=0.02)
+        spectrogram = compute_spectrogram(capture.ravel())
+        # Recover power from the plotted dB levels; none of them is at the floor.
+        levels = spectrogram.levels
+        self.assertGreater(levels.min(), FLOOR_DB)
+        power = 10 ** (levels / 10)
+        spectrum = spectrogram.segments @ power / spectrogram.segments.sum()
+        peak = int(np.argmax(spectrum))
+        above = 10 * np.log10(spectrum[peak] / np.median(spectrum))
+        totals = power.sum(axis=1)
+        change = 10 * np.log10(totals.max() / totals.min())
+        text = self.summarize(spectrogram)
+        where = round(float(spectrogram.frequencies[peak]), 3) + 0.0
+        self.assertIn(f"the strongest frequency is {where:.3f} cycles per sample", text)
+        self.assertIn(f", {above:.1f} dB above the median bin.", text)
+        self.assertIn(f"within {change:.1f} dB of the loudest", text)
+
+
 class EdgeCaseTests(SummaryTestCase):
     def test_all_zero_window(self):
-        time_text, constellation_text, spectrum_text, _ = self.all_summaries(
-            np.zeros(SAMPLES_PER_WINDOW, dtype=complex)
+        time_text, constellation_text, spectrum_text, _, spectrogram_text, _ = (
+            self.all_summaries(np.zeros(SAMPLES_PER_WINDOW, dtype=complex))
         )
         self.assertIn("RMS amplitude is 0 for I and 0 for Q", time_text)
         self.assertIn("all at the origin because every sample is zero", constellation_text)
         self.assertIn("flat, because every sample is zero", spectrum_text)
+        self.assertIn(f"Every cell is at the {FLOOR_DB:g} dB floor", spectrogram_text)
 
     def test_largest_finite_components(self):
         for value, rms_i, rms_q, distance in (
@@ -278,14 +448,14 @@ class EdgeCaseTests(SummaryTestCase):
             (complex(-LARGEST, LARGEST), "1.80e+308", "1.80e+308", "2.54e+308"),
         ):
             with self.subTest(value=value):
-                time_text, constellation_text, _, _ = self.all_summaries(
+                time_text, constellation_text, *_ = self.all_summaries(
                     np.full(SAMPLES_PER_WINDOW, value)
                 )
                 self.assertIn(f"is {rms_i} for I and {rms_q} for Q", time_text)
                 self.assertIn(f"averages {distance}, with a coefficient of variation of 0.00", constellation_text)
 
     def test_subnormal_components(self):
-        time_text, constellation_text, _, _ = self.all_summaries(
+        time_text, constellation_text, *_ = self.all_summaries(
             np.full(SAMPLES_PER_WINDOW, complex(SMALLEST, SMALLEST))
         )
         self.assertIn("is 4.94e-324 for I and 4.94e-324 for Q", time_text)

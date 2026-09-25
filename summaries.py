@@ -1,9 +1,9 @@
 """Plain-language text alternatives for the app's charts.
 
-Each summary is one or two sentences with the numbers a sighted reader takes
+Each summary is a few short sentences with the numbers a sighted reader takes
 from a chart. Summaries of the samples never name a modulation; only summaries
-of the model's output name its classes. Only NumPy and the standard library
-are used.
+of the model's output name its classes. Only NumPy, the standard library, and
+the NumPy-only spectrogram module are used.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import math
 import numpy as np
 
 from signal_config import REASON_UNFAMILIAR, UNCERTAIN
+from spectrogram import FLOOR_DB, Spectrogram
 
 
 _SI_SCALES = ((1e9, "G", "billion"), (1e6, "M", "million"), (1e3, "k", "thousand"))
@@ -21,6 +22,9 @@ _SI_SCALES = ((1e9, "G", "billion"), (1e6, "M", "million"), (1e3, "k", "thousand
 SPECTRUM_FLOOR = 1e-8
 # The timeline summary lists at most this many runs of equal decisions.
 MAX_LISTED_RUNS = 6
+# The spectrogram summary calls the overall level steady when every time step
+# is within this many dB of the loudest one (3 dB is half the power).
+STEADY_LEVEL_DB = 3.0
 
 
 def _round_significant(value: float, digits: int) -> float:
@@ -44,6 +48,20 @@ def format_sample_rate(rate: float) -> str:
         if rate >= scale:
             return f"{rate / scale:.6g} {word} samples per second"
     return f"{rate:.6g} samples per second"
+
+
+def format_duration(seconds: float) -> str:
+    """Readable time such as 21.3 milliseconds."""
+    seconds = _round_significant(seconds, 3)
+    if seconds == 0:
+        return "0 seconds"
+    for scale, unit in ((1.0, "second"), (1e-3, "millisecond"), (1e-6, "microsecond")):
+        if abs(seconds) >= scale:
+            break
+    else:
+        scale, unit = 1e-9, "nanosecond"
+    number = f"{seconds / scale:,g}"
+    return f"{number} {unit}" + ("" if number == "1" else "s")
 
 
 def _as_samples(samples: np.ndarray) -> np.ndarray:
@@ -147,6 +165,25 @@ def spectrum_db(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return frequencies, levels
 
 
+def _frequency_phrase(
+    cycles: float, sample_rate: float | None, center_frequency: float | None
+) -> str:
+    """A frequency in cycles per sample, plus its offset in hertz when the
+    sample rate is known and its radio frequency when the center is known."""
+    where = f"{round(cycles, 3) + 0.0:.3f} cycles per sample"  # + 0.0 turns -0.0 into 0.0.
+    if sample_rate is not None:
+        offset = cycles * sample_rate
+        if offset == 0:
+            relation = "the center of the recorded band"
+        else:
+            side = "above" if offset > 0 else "below"
+            relation = f"{format_frequency(abs(offset), 3)} {side} the center of the recorded band"
+        if center_frequency is not None and math.isfinite(center_frequency + offset):
+            relation += f", about {format_frequency(center_frequency + offset)}"
+        where += f" ({relation})"
+    return where
+
+
 def spectrum_summary(
     samples: np.ndarray,
     sample_rate: float | None = None,
@@ -168,21 +205,96 @@ def spectrum_summary(
     if above < 0.05:
         return f"Spectrum of {bins}: flat; no bin is more than 0.1 dB above the median bin."
 
-    cycles = float(frequencies[peak])
-    where = f"{round(cycles, 3) + 0.0:.3f} cycles per sample"  # + 0.0 turns -0.0 into 0.0.
-    if sample_rate is not None:
-        offset = cycles * sample_rate
-        if offset == 0:
-            relation = "the center of the recorded band"
-        else:
-            side = "above" if offset > 0 else "below"
-            relation = f"{format_frequency(abs(offset), 3)} {side} the center of the recorded band"
-        if center_frequency is not None and math.isfinite(center_frequency + offset):
-            relation += f", about {format_frequency(center_frequency + offset)}"
-        where += f" ({relation})"
+    where = _frequency_phrase(float(frequencies[peak]), sample_rate, center_frequency)
     return (
         f"Spectrum of {bins}: the strongest bin is at {where}. "
         f"It is {above:.1f} dB above the median bin."
+    )
+
+
+def _decibels_below(ratio: float) -> float:
+    """How far a power ratio of at most 1 lies below 1, in dB, at most -FLOOR_DB."""
+    return -10 * math.log10(max(ratio, 10 ** (FLOOR_DB / 10))) + 0.0  # Never -0.0.
+
+
+def _amount(decibels: float) -> str:
+    return f"at least {-FLOOR_DB:g} dB" if decibels >= -FLOOR_DB else f"{decibels:.1f} dB"
+
+
+def _time_step_position(spectrogram: Spectrogram, row: int, sample_rate: float | None) -> str:
+    center = float(spectrogram.centers[row])
+    if sample_rate is not None and math.isfinite(center / sample_rate):
+        return format_duration(center / sample_rate)
+    return f"sample {math.floor(center + 0.5):,}"
+
+
+def spectrogram_summary(
+    spectrogram: Spectrogram,
+    sample_rate: float | None = None,
+    center_frequency: float | None = None,
+) -> str:
+    """Describe the spectrogram: its layout, the strongest frequency of the
+    time-averaged spectrum, and how much the overall level changes between
+    time steps. Every number comes from the plotted power.
+    """
+    power = spectrogram.power
+    steps, bins = power.shape
+    segments = spectrogram.segments
+    length = f"{spectrogram.segment_length:,}-sample"
+    if segments.max() == 1:
+        layout = f"each is one {length} segment, overlapping the next by half"
+    else:
+        layout = f"each averages {segments[0]:,} overlapping {length} segments"
+        if segments[-1] != segments[0]:
+            layout += f" (the last averages {segments[-1]:,})"
+    text = (
+        f"The spectrogram shows {bins:,} frequency bins across and "
+        f"{steps:,} time step{'' if steps == 1 else 's'} down; {layout}."
+    )
+    if spectrogram.ignored_samples:
+        text += (
+            f" The last {spectrogram.ignored_samples:,} samples, which do not fill a "
+            "segment, are left out."
+        )
+    if not power.any():
+        return (
+            f"{text} Every cell is at the {FLOOR_DB:g} dB floor because no segment holds "
+            "any power, for example because every sample is zero."
+        )
+
+    # Each row is the mean of its segments, so weighting the rows by their
+    # segment counts gives the mean over all segments.
+    spectrum = segments @ power / segments.sum()
+    peak = int(np.argmax(spectrum))
+    above = _decibels_below(float(np.median(spectrum) / spectrum[peak]))
+    if above < 0.05:
+        text += (
+            " Averaged over time, the spectrum is flat; no bin is more than 0.1 dB above "
+            "the median bin."
+        )
+    else:
+        where = _frequency_phrase(
+            float(spectrogram.frequencies[peak]), sample_rate, center_frequency
+        )
+        text += (
+            f" Averaged over time, the strongest frequency is {where}, "
+            f"{_amount(above)} above the median bin."
+        )
+    if steps == 1:
+        return text
+
+    totals = power.sum(axis=1)
+    loudest, quietest = int(np.argmax(totals)), int(np.argmin(totals))
+    change = round(_decibels_below(float(totals[quietest] / totals[loudest])), 1)
+    if change < STEADY_LEVEL_DB:
+        return (
+            f"{text} The overall level is steady over time: every time step is within "
+            f"{change:.1f} dB of the loudest."
+        )
+    return (
+        f"{text} The overall level changes over time: the quietest time step, around "
+        f"{_time_step_position(spectrogram, quietest, sample_rate)}, is {_amount(change)} "
+        f"below the loudest, around {_time_step_position(spectrogram, loudest, sample_rate)}."
     )
 
 

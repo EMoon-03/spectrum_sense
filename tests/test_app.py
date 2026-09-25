@@ -13,6 +13,7 @@ from unittest.mock import patch
 import warnings
 
 import numpy as np
+import plotly.colors
 import streamlit as st
 from streamlit import config
 from streamlit.testing.v1 import AppTest, element_tree
@@ -26,6 +27,7 @@ from signal_config import (
     SAMPLES_PER_WINDOW,
     UNCERTAIN,
 )
+from spectrogram import FLOOR_DB, MAX_TIME_STEPS, SEGMENT_LENGTH, compute_spectrogram
 from spectrum_sense import (
     build_demo_model,
     classify_recording,
@@ -34,6 +36,7 @@ from spectrum_sense import (
     generate_capture,
     generate_probe_capture,
 )
+from summaries import spectrogram_summary
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -48,9 +51,13 @@ SUMMARY_STARTS = {
     "constellation": f"The I/Q plane shows {SAMPLES_PER_WINDOW // 2} points",
     "fft": f"Spectrum of {SAMPLES_PER_WINDOW:,} frequency bins",
 }
-# Only the upload tab has a timeline of every window's decision.
-TIMELINE_START = "The timeline shows "
-UPLOAD_CHARTS = {"timeline", *SUMMARY_STARTS}
+# Only the upload tab has whole-recording charts: a timeline of every window's
+# decision and a spectrogram.
+UPLOAD_ONLY_STARTS = {
+    "timeline": "The timeline shows ",
+    "spectrogram": f"The spectrogram shows {SEGMENT_LENGTH} frequency bins across",
+}
+UPLOAD_CHARTS = {*UPLOAD_ONLY_STARTS, *SUMMARY_STARTS}
 
 
 def named_upload(name: str, payload: bytes) -> BytesIO:
@@ -73,7 +80,10 @@ def sigmf_files(samples: np.ndarray) -> tuple[bytes, bytes]:
 def plotly_values(values) -> np.ndarray:
     """Numbers from a Plotly JSON spec: a list, or base64 data in Plotly 6."""
     if isinstance(values, dict):
-        return np.frombuffer(base64.b64decode(values["bdata"]), dtype=values["dtype"])
+        array = np.frombuffer(base64.b64decode(values["bdata"]), dtype=values["dtype"])
+        if "shape" in values:
+            array = array.reshape([int(size) for size in values["shape"].split(",")])
+        return array
     return np.asarray(values, dtype=float)
 
 
@@ -136,7 +146,7 @@ class AppTestCase(unittest.TestCase):
         summaries = self.chart_summaries(block)
         starts = dict(SUMMARY_STARTS)
         if section == "uploaded":
-            starts["timeline"] = TIMELINE_START
+            starts.update(UPLOAD_ONLY_STARTS)
         self.assertEqual(set(summaries), {f"{section}-{kind}" for kind in starts})
         for kind, start in starts.items():
             with self.subTest(section=section, chart=kind):
@@ -200,6 +210,10 @@ class AppTests(AppTestCase):
             " ".join(caption.value for caption in app.caption),
         )
         self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
+        # The spectrogram averages neighboring segments to stay light.
+        levels = plotly_values(self.chart_spec(app, "uploaded-spectrogram")["data"][0]["z"])
+        self.assertEqual(levels.shape, (390, SEGMENT_LENGTH))
+        self.assertLessEqual(len(levels), MAX_TIME_STEPS)
 
     def test_malformed_csv_shows_error_without_crashing(self):
         app = self.run_csv(b'I,Q\n"1"0,2\n')
@@ -215,10 +229,15 @@ class AppTests(AppTestCase):
         # The file loaded, so the hint about loading a file does not apply.
         self.assertNotIn(EXAMPLE_LABEL, app.error[0].value)
         # The whole-file timeline marks the window as not classifiable instead.
-        self.assertEqual(self.uploaded_charts(app), {"timeline", "time", "constellation", "fft"})
+        self.assertEqual(
+            self.uploaded_charts(app), {"timeline", "spectrogram", "time", "constellation", "fft"}
+        )
         summaries = self.chart_summaries(app.tabs[1])
         self.assertIn("every sample is zero", summaries["uploaded-constellation"])
         self.assertIn("every sample is zero", summaries["uploaded-fft"])
+        self.assertIn(
+            f"Every cell is at the {FLOOR_DB:g} dB floor", summaries["uploaded-spectrogram"]
+        )
 
     def test_maximum_finite_iq_upload_has_no_numeric_warnings(self):
         maximum = repr(float(np.finfo(np.float64).max))
@@ -319,7 +338,12 @@ class AccessibilityTests(AppTestCase):
         # it, so no level is skipped.
         self.assertEqual(
             [item.value for item in app.subheader],
-            ["Every window", "One window in detail", 'When the model answers "uncertain"'],
+            [
+                "Every window",
+                "Frequency content over time",
+                "One window in detail",
+                'When the model answers "uncertain"',
+            ],
         )
         for tab in app.tabs:
             with self.subTest(tab=tab.label):
@@ -368,6 +392,50 @@ class AccessibilityTests(AppTestCase):
         for widget in widgets:
             with self.subTest(widget=widget.proto.label):
                 self.assertRegex(widget.proto.help, r"^[A-Z].*\.$")
+
+    def test_spectrogram_uses_an_ordered_color_scale_and_matches_its_summary(self):
+        samples = load_uploads([("example.csv", self.example_csv().encode())]).samples
+        app = self.run_csv(to_csv(samples).encode())
+        spec = self.chart_spec(app, "uploaded-spectrogram")
+        (heatmap,) = spec["data"]
+        self.assertEqual(heatmap["type"], "heatmap")
+        # Cividis grows lighter with level, so levels do not depend on hue.
+        self.assertEqual(
+            [color.lower() for _, color in heatmap["colorscale"]],
+            [color.lower() for color in plotly.colors.sequential.Cividis],
+        )
+        self.assertEqual((heatmap["zmin"], heatmap["zmax"]), (FLOOR_DB, 0))
+        self.assertEqual(heatmap["colorbar"]["title"]["text"], "Level (dB, 0 = strongest)")
+        self.assertIn("Level: %{z:.1f} dB", heatmap["hovertemplate"])
+        self.assertEqual(spec["layout"]["yaxis"]["autorange"], "reversed")
+        self.assertEqual(spec["layout"]["xaxis"]["title"]["text"], "Frequency (cycles per sample)")
+        self.assertEqual(spec["layout"]["yaxis"]["title"]["text"], "Sample")
+
+        expected = compute_spectrogram(samples)
+        np.testing.assert_array_equal(
+            plotly_values(heatmap["z"]), expected.levels.astype(np.float32)
+        )
+        np.testing.assert_array_equal(plotly_values(heatmap["x"]), expected.frequencies)
+        np.testing.assert_array_equal(plotly_values(heatmap["y"]), expected.centers)
+        caption = self.chart_summaries(app.tabs[1])["uploaded-spectrogram"]
+        self.assertEqual(caption, spectrogram_summary(expected))
+        self.assertNotIn("Hz", caption)
+
+    def test_spectrogram_uses_hertz_and_seconds_with_a_sample_rate(self):
+        capture, _, _ = generate_capture("QPSK", np.random.default_rng(12), windows=2)
+        meta, data = sigmf_files(capture.ravel())
+        app = self.run_app(("rec.sigmf-meta", meta), ("rec.sigmf-data", data))
+        spec = self.chart_spec(app, "uploaded-spectrogram")
+        (heatmap,) = spec["data"]
+        self.assertEqual(
+            spec["layout"]["xaxis"]["title"]["text"], "Frequency from the band center (Hz)"
+        )
+        self.assertEqual(spec["layout"]["yaxis"]["title"]["text"], "Time (s)")
+        expected = compute_spectrogram(capture.ravel().astype(np.complex64))
+        np.testing.assert_allclose(plotly_values(heatmap["x"]), expected.frequencies * 2.4e6)
+        np.testing.assert_allclose(plotly_values(heatmap["y"]), expected.centers / 2.4e6)
+        caption = self.chart_summaries(app.tabs[1])["uploaded-spectrogram"]
+        self.assertRegex(caption, r"the center of the recorded band, about [\d.]+ MHz\)")
 
     def test_upload_tab_example_is_fixed_and_loads(self):
         first = self.example_csv()

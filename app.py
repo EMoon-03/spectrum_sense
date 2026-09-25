@@ -21,6 +21,7 @@ from signal_config import (
     SNR_DB_RANGE,
     UNCERTAIN,
 )
+from spectrogram import FLOOR_DB, Spectrogram, compute_spectrogram
 from spectrum_sense import (
     DemoModel,
     FileClassification,
@@ -40,6 +41,7 @@ from summaries import (
     format_frequency,
     format_sample_rate,
     scores_summary,
+    spectrogram_summary,
     spectrum_db,
     spectrum_summary,
     time_summary,
@@ -69,6 +71,10 @@ MARKER_SYMBOLS = {
     NOT_CLASSIFIABLE: "triangle-up",
 }
 MARKER_COLORS = {UNCERTAIN: VERMILLION, NOT_CLASSIFIABLE: GRAY}
+# Cividis grows steadily lighter from dark blue to yellow (OKLab lightness 0.26
+# to 0.92), so levels read by lightness alone, with any color vision, and in
+# light or dark themes.
+SPECTROGRAM_COLORSCALE = "Cividis"
 UNCERTAIN_NOTE = (
     '"Uncertain" comes from a simple distance-and-score heuristic that was tested only '
     f"on synthetic probe signals ({', '.join(PROBE_KINDS[:-1])}, and an unmodulated "
@@ -104,6 +110,13 @@ def classify_upload(
     from them and the model never changes in a process, so neither is hashed.
     """
     return classify_recording(_model, _samples)
+
+
+@st.cache_data(max_entries=2, show_spinner=False, scope="session")
+def upload_spectrogram(files: tuple[tuple[str, bytes], ...], _samples: np.ndarray) -> Spectrogram:
+    """Compute the whole-file spectrogram once per upload; like classify_upload,
+    the cache key is the uploaded (name, data) pairs."""
+    return compute_spectrogram(_samples)
 
 
 @st.cache_data(show_spinner=False)
@@ -209,6 +222,43 @@ def window_hover(result: FileClassification, index: int) -> str:
     if label == UNCERTAIN:
         detail = f"{result.reasons[index]}; {detail}"
     return f"{where}<br>{label} ({detail})"
+
+
+def show_spectrogram(
+    spectrogram: Spectrogram, sample_rate: float | None, center_frequency: float | None
+) -> None:
+    """A waterfall of the whole recording (frequency across, time running down)
+    with a labeled color bar, cell values on hover, and a text summary underneath."""
+    frequencies, frequency_title = spectrogram.frequency_axis(sample_rate)
+    times, time_title = spectrogram.time_axis(sample_rate)
+    frequency_hover = (
+        "%{x:.4f} cycles per sample" if sample_rate is None else "%{x:.3s}Hz from the band center"
+    )
+    time_hover = "sample %{y:,.0f}" if time_title == "Sample" else "%{y:.3s}s"
+    heatmap = go.Figure(
+        go.Heatmap(
+            x=frequencies, y=times, z=spectrogram.levels.astype(np.float32),
+            colorscale=SPECTROGRAM_COLORSCALE, zmin=FLOOR_DB, zmax=0,
+            colorbar=dict(
+                title=dict(text="Level (dB, 0 = strongest)", side="right"),
+                tickvals=np.linspace(FLOOR_DB, 0, 5),
+            ),
+            hovertemplate=(
+                f"Frequency: {frequency_hover}<br>Time: {time_hover}<br>"
+                "Level: %{z:.1f} dB<extra></extra>"
+            ),
+        )
+    )
+    heatmap.update_layout(
+        title="Spectrogram of the whole recording (time runs down)", height=440,
+        xaxis_title=frequency_title, yaxis=dict(title=time_title, autorange="reversed"),
+    )
+    st.write(
+        "Each row is a moment in the recording, from top to bottom, and each column is "
+        "a frequency. Lighter cells hold more power; hover over a cell to read its level."
+    )
+    st.plotly_chart(heatmap, key="uploaded-spectrogram")
+    st.caption(spectrogram_summary(spectrogram, sample_rate, center_frequency))
 
 
 def show_file_results(result: FileClassification) -> None:
@@ -401,6 +451,11 @@ with upload_tab:
             )
             st.subheader("Every window")
             show_file_results(classify_upload(files, values, model))
+
+            st.subheader("Frequency content over time")
+            show_spectrogram(
+                upload_spectrogram(files, values), loaded.sample_rate, loaded.center_frequency
+            )
 
             st.subheader("One window in detail")
             available = len(values) // SAMPLES_PER_WINDOW

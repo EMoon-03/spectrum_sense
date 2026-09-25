@@ -34,20 +34,27 @@ The app has three tabs:
   sample, answer, reason, distance, and score per class) as a CSV. Windows that
   cannot be classified, such as all-zero windows, are marked "not classifiable",
   and the tab says how many trailing samples after the last complete window
-  were ignored. Below that, you can plot and score any single window. The tab
+  were ignored. A spectrogram (waterfall) then shows the power at each
+  frequency over the whole recording, in hertz and seconds when the file
+  states a sample rate. It uses Hann-windowed 256-sample segments that overlap
+  by half, averages neighboring segments so that at most 400 time steps are
+  drawn, and gives levels in dB relative to the strongest cell, with a floor
+  of -80 dB. Below that, you can plot and score any single window. The tab
   offers a fixed example CSV to download and upload as a first try; the CSV
   from the first tab works too.
 - **How the model works:** inspect its grouped test accuracy, the limits behind
   the "uncertain" answer and how often it fires, and learn what the synthetic
   score does and does not establish.
 
-Each chart has a one- or two-sentence text summary directly below it with the
-numbers it shows, such as the model scores, the RMS of I and Q, the strongest
-frequency bin, and the runs of answers in the timeline. Score bars print their
-values, the Q line is dashed so I and Q never differ by color alone, timeline
-answers differ by row and marker shape, the colors (Okabe-Ito blue and
-vermillion, plus gray) stay distinct with color-vision deficiency, and every
-control has help text.
+Each chart has a short text summary directly below it with the numbers it
+shows, such as the model scores, the RMS of I and Q, the strongest frequency
+bin, the runs of answers in the timeline, and how much the spectrogram's level
+changes over time. Score bars print their values, the Q line is dashed so I and
+Q never differ by color alone, timeline answers differ by row and marker shape,
+the colors (Okabe-Ito blue and vermillion, plus gray) stay distinct with
+color-vision deficiency, and every control has help text. The spectrogram uses
+the Cividis color scale, which grows steadily lighter with level, has a labeled
+color bar, and shows each cell's level on hover.
 
 ### The "uncertain" answer
 
@@ -120,8 +127,8 @@ With the dependencies installed, run:
 The tests cover CSV validation and limits, lossless float64 interchange, the
 raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
 extreme amplitudes, the "uncertain" answer and its probe signals, whole-file
-classification and its CSV, and the chart summaries and other accessibility
-features.
+classification and its CSV, the spectrogram, and the chart summaries and other
+accessibility features.
 
 ## Run the command-line baseline
 
