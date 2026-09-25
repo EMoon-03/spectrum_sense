@@ -1,7 +1,8 @@
 """Integration regressions for recording uploads and accessibility in the Streamlit app."""
 
 import base64
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import re
@@ -18,14 +19,28 @@ from streamlit.testing.v1 import AppTest, element_tree
 
 from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, to_csv
 from iq_formats import MAX_FILE_BYTES, load_uploads
-from signal_config import SAMPLES_PER_SYMBOL, SAMPLES_PER_WINDOW
-from spectrum_sense import generate_capture
+from signal_config import (
+    NOT_CLASSIFIABLE,
+    PROBE_KINDS,
+    SAMPLES_PER_SYMBOL,
+    SAMPLES_PER_WINDOW,
+    UNCERTAIN,
+)
+from spectrum_sense import (
+    build_demo_model,
+    classify_recording,
+    decision_counts,
+    decision_order,
+    generate_capture,
+    generate_probe_capture,
+)
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 # Older Streamlit releases cannot upload files through AppTest.
 CAN_UPLOAD = hasattr(getattr(element_tree, "FileUploader", None), "set_value")
 EXAMPLE_LABEL = "Download an example CSV"
+RESULTS_LABEL = "Download per-window results as CSV"
 # The text summary that must sit directly under each chart, by chart key.
 SUMMARY_STARTS = {
     "scores": "Scores: ",
@@ -33,6 +48,9 @@ SUMMARY_STARTS = {
     "constellation": f"The I/Q plane shows {SAMPLES_PER_WINDOW // 2} points",
     "fft": f"Spectrum of {SAMPLES_PER_WINDOW:,} frequency bins",
 }
+# Only the upload tab has a timeline of every window's decision.
+TIMELINE_START = "The timeline shows "
+UPLOAD_CHARTS = {"timeline", *SUMMARY_STARTS}
 
 
 def named_upload(name: str, payload: bytes) -> BytesIO:
@@ -116,8 +134,11 @@ class AppTestCase(unittest.TestCase):
 
     def assert_charts_have_summaries(self, block, section: str) -> dict[str, str]:
         summaries = self.chart_summaries(block)
-        self.assertEqual(set(summaries), {f"{section}-{kind}" for kind in SUMMARY_STARTS})
-        for kind, start in SUMMARY_STARTS.items():
+        starts = dict(SUMMARY_STARTS)
+        if section == "uploaded":
+            starts["timeline"] = TIMELINE_START
+        self.assertEqual(set(summaries), {f"{section}-{kind}" for kind in starts})
+        for kind, start in starts.items():
             with self.subTest(section=section, chart=kind):
                 self.assertTrue(summaries[f"{section}-{kind}"].startswith(start), summaries)
         return summaries
@@ -178,7 +199,7 @@ class AppTests(AppTestCase):
             f"Showing window 1 of {MAX_SAMPLES // SAMPLES_PER_WINDOW}",
             " ".join(caption.value for caption in app.caption),
         )
-        self.assertEqual(self.uploaded_charts(app), {"scores", "time", "constellation", "fft"})
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
 
     def test_malformed_csv_shows_error_without_crashing(self):
         app = self.run_csv(b'I,Q\n"1"0,2\n')
@@ -193,7 +214,8 @@ class AppTests(AppTestCase):
         self.assertIn("only zeros", app.error[0].value)
         # The file loaded, so the hint about loading a file does not apply.
         self.assertNotIn(EXAMPLE_LABEL, app.error[0].value)
-        self.assertEqual(self.uploaded_charts(app), {"time", "constellation", "fft"})
+        # The whole-file timeline marks the window as not classifiable instead.
+        self.assertEqual(self.uploaded_charts(app), {"timeline", "time", "constellation", "fft"})
         summaries = self.chart_summaries(app.tabs[1])
         self.assertIn("every sample is zero", summaries["uploaded-constellation"])
         self.assertIn("every sample is zero", summaries["uploaded-fft"])
@@ -207,7 +229,7 @@ class AppTests(AppTestCase):
         numeric_warnings = [str(item.message) for item in recorded if issubclass(item.category, RuntimeWarning)]
         self.assertEqual(numeric_warnings, [])
         self.assertEqual(len(app.error), 0)
-        self.assertEqual(self.uploaded_charts(app), {"scores", "time", "constellation", "fft"})
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
 
     def test_raw_sdr_upload_shows_format_and_windows(self):
         capture, _, _ = generate_capture("BPSK", np.random.default_rng(11), windows=2)
@@ -220,7 +242,7 @@ class AppTests(AppTestCase):
         self.assertIn(f"**Samples:** {2 * SAMPLES_PER_WINDOW:,}", details)
         self.assertNotIn("Sample rate:", details)
         self.assertIn("Showing window 1 of 2", " ".join(caption.value for caption in app.caption))
-        self.assertEqual(self.uploaded_charts(app), {"scores", "time", "constellation", "fft"})
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
 
     def test_sigmf_archive_and_pair_show_their_metadata(self):
         capture, _, _ = generate_capture("QPSK", np.random.default_rng(12), windows=1)
@@ -239,7 +261,7 @@ class AppTests(AppTestCase):
                 timing_note = " ".join(item.value for item in app.info)
                 self.assertIn(f"{SAMPLES_PER_SYMBOL} samples per symbol", timing_note)
                 self.assertIn("sample rate does not change what the model expects", timing_note)
-                self.assertEqual(self.uploaded_charts(app), {"scores", "time", "constellation", "fft"})
+                self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
                 spectrum = self.assert_charts_have_summaries(app.tabs[1], "uploaded")["uploaded-fft"]
                 self.assertRegex(spectrum, r"the center of the recorded band, about [\d.]+ MHz\)")
 
@@ -277,7 +299,7 @@ class AppTests(AppTestCase):
         app = slider.set_value(2).run(timeout=20)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
         self.assertIn("Showing window 2 of 2", " ".join(caption.value for caption in app.caption))
-        self.assertEqual(self.uploaded_charts(app), {"scores", "time", "constellation", "fft"})
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
 
 
 class AccessibilityTests(AppTestCase):
@@ -286,19 +308,24 @@ class AccessibilityTests(AppTestCase):
         self.addCleanup(st.cache_data.clear)
 
     def test_title_is_plain_text_and_headings_are_in_order(self):
-        app = self.run_app()
+        app = self.run_csv(self.example_csv().encode())
         (title,) = app.title
         self.assertEqual(title.value, "SpectrumSense Signal Lab")
         self.assertEqual(
             [char for char in title.value if unicodedata.category(char) in ("So", "Mn", "Cf")], []
         )
         self.assertEqual(title.tag, "h1")
-        # Each tab opens with a level-2 heading, so no level is skipped.
-        self.assertEqual(len(app.subheader), 0)
+        # Each tab opens with a level-2 heading and only level-3 headings follow
+        # it, so no level is skipped.
+        self.assertEqual(
+            [item.value for item in app.subheader],
+            ["Every window", "One window in detail", 'When the model answers "uncertain"'],
+        )
         for tab in app.tabs:
             with self.subTest(tab=tab.label):
                 first = ordered_children(tab)[0]
                 self.assertEqual((first.type, first.tag), ("header", "h2"))
+                self.assertEqual({item.tag for item in tab.get("subheader")} - {"h3"}, set())
 
     def test_lab_and_upload_charts_each_have_a_summary_directly_below(self):
         app = self.run_csv(self.example_csv().encode())
@@ -334,7 +361,9 @@ class AccessibilityTests(AppTestCase):
             *app.get("download_button"),
         ]
         labels = [widget.proto.label for widget in widgets]
-        for label in ("Signal type", "Example seed", "Window to inspect", EXAMPLE_LABEL):
+        for label in (
+            "Signal type", "Example seed", "Window to inspect", EXAMPLE_LABEL, RESULTS_LABEL,
+        ):
             self.assertIn(label, labels)
         for widget in widgets:
             with self.subTest(widget=widget.proto.label):
@@ -353,6 +382,149 @@ class AccessibilityTests(AppTestCase):
         self.assertIn(EXAMPLE_LABEL, labels)
         self.assertEqual(len(app.error), 0)
         self.assertIn("Showing window 1 of 2", " ".join(caption.value for caption in app.caption))
+
+
+class UncertainAndWholeFileTests(AppTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.demo = build_demo_model()
+
+    def setUp(self):
+        st.cache_data.clear()
+        self.addCleanup(st.cache_data.clear)
+
+    @staticmethod
+    def known_windows() -> np.ndarray:
+        """The two BPSK windows of the upload tab's example CSV."""
+        capture, _, _ = generate_capture("BPSK", np.random.default_rng(2024), windows=2)
+        return capture.ravel()
+
+    @staticmethod
+    def tone(windows: int) -> np.ndarray:
+        return generate_probe_capture("tone", np.random.default_rng(5), windows, snr_db=10).ravel()
+
+    def test_default_lab_signal_gets_a_class_and_an_explanation(self):
+        app = self.run_app()
+        (metric,) = app.tabs[0].metric
+        self.assertEqual((metric.label, metric.value), ("Demo model prediction", "BPSK"))
+        text = self.markdown_text(app)
+        self.assertRegex(
+            text, r"The model names BPSK: the window is \d+\.\d from the nearest trained class "
+            r"\(limit \d+\.\d\) and the top score is \d\.\d\d \(minimum 0\.60\)\."
+        )
+
+    def test_unfamiliar_upload_is_uncertain_and_names_the_leading_candidate(self):
+        app = self.run_csv(to_csv(self.tone(1)).encode())
+        self.assertEqual(len(app.error), 0)
+        (metric,) = app.tabs[1].metric
+        self.assertEqual((metric.label, metric.value), ("Demo model prediction", "Uncertain"))
+        self.assertRegex(
+            self.markdown_text(app),
+            r"Uncertain because the window is unlike the training data: it is \d+\.\d from "
+            r"the nearest trained class, beyond the limit of \d+\.\d\. The leading candidate "
+            r"is (noise|BPSK|QPSK) with a score of \d\.\d\d\.",
+        )
+        captions = " ".join(caption.value for caption in app.tabs[1].caption)
+        for claim in (
+            "simple distance-and-score heuristic",
+            "tested only on synthetic probe signals",
+            "not validated unknown-signal detection",
+            "very-low-SNR signals can still be called noise",
+        ):
+            self.assertIn(claim, captions)
+
+    def test_every_window_is_classified_counted_and_downloadable(self):
+        samples = np.concatenate(
+            [self.known_windows(), np.zeros(SAMPLES_PER_WINDOW), np.ones(10)]
+        )
+        expected = classify_recording(self.demo.model, samples)
+        self.assertEqual(expected.labels, ("BPSK", "BPSK", NOT_CLASSIFIABLE))
+        app, downloads = self.run_and_record_downloads(("mixed.csv", to_csv(samples).encode()))
+        # Window 1, which is inspected below the whole-file results, is classifiable.
+        self.assertEqual(len(app.error), 0)
+        upload_tab = app.tabs[1]
+        summary = self.chart_summaries(upload_tab)["uploaded-timeline"]
+        self.assertEqual(
+            summary,
+            f"The timeline shows 3 windows: 2 BPSK, 1 {NOT_CLASSIFIABLE}. In order, "
+            f"windows 1 to 2: BPSK; window 3: {NOT_CLASSIFIABLE}.",
+        )
+        (table,) = upload_tab.dataframe
+        self.assertEqual(
+            list(zip(table.value["Decision"], table.value["Windows"])), decision_counts(expected)
+        )
+        self.assertEqual(list(table.value["Share of windows"])[1], "66.7%")
+        captions = " ".join(caption.value for caption in upload_tab.caption)
+        self.assertIn(
+            "The last 10 samples, after window 3, were ignored because they do not fill a "
+            f"complete {SAMPLES_PER_WINDOW:,}-sample window.",
+            captions,
+        )
+        self.assertIn("Showing window 1 of 3", captions)
+
+        rows = list(csv.DictReader(StringIO(downloads[RESULTS_LABEL])))
+        self.assertEqual([row["window"] for row in rows], ["1", "2", "3"])
+        starts = [str(index * SAMPLES_PER_WINDOW) for index in range(3)]
+        self.assertEqual([row["start_sample"] for row in rows], starts)
+        self.assertEqual([row["decision"] for row in rows], list(expected.labels))
+        self.assertIn("only zeros", rows[2]["reason"])
+        self.assertEqual(rows[2]["score_BPSK"], "")
+        for row in rows[:2]:
+            total = sum(float(row[f"score_{name}"]) for name in ("noise", "BPSK", "QPSK"))
+            self.assertAlmostEqual(total, 1.0, places=5)
+
+    def test_whole_recording_leaves_no_ignored_samples_note(self):
+        app = self.run_csv(to_csv(self.known_windows()).encode())
+        captions = " ".join(caption.value for caption in app.tabs[1].caption)
+        self.assertIn("The timeline shows 2 windows: 2 BPSK.", captions)
+        self.assertNotIn("were ignored", captions)
+
+    def test_timeline_shows_decisions_by_position_and_marker_shape(self):
+        samples = np.concatenate(
+            [self.known_windows(), self.tone(2), np.zeros(SAMPLES_PER_WINDOW)]
+        )
+        app = self.run_csv(to_csv(samples).encode())
+        spec = self.chart_spec(app, "uploaded-timeline")
+        self.assertEqual(list(spec["layout"]["yaxis"]["categoryarray"]), list(decision_order()))
+        traces = spec["data"]
+        self.assertEqual([trace["name"] for trace in traces], ["BPSK", UNCERTAIN, NOT_CLASSIFIABLE])
+        symbols = [trace["marker"]["symbol"] for trace in traces]
+        self.assertEqual(len(set(symbols)), len(symbols))
+        windows = {}
+        for trace in traces:
+            self.assertEqual(trace["mode"], "markers")
+            self.assertEqual(set(trace["y"]), {trace["name"]})
+            windows[trace["name"]] = plotly_values(trace["x"]).tolist()
+        self.assertEqual(windows, {"BPSK": [1, 2], UNCERTAIN: [3, 4], NOT_CLASSIFIABLE: [5]})
+        self.assertIn(
+            f"windows 3 to 4: {UNCERTAIN}", self.chart_summaries(app.tabs[1])["uploaded-timeline"]
+        )
+
+    def test_about_tab_reports_limits_and_measured_rates(self):
+        app = self.run_app()
+        about = app.tabs[2]
+        demo, model = self.demo, self.demo.model
+        metrics = {metric.label: metric.value for metric in about.metric}
+        self.assertEqual(metrics["Calibration captures"], str(demo.calibration_captures))
+        self.assertEqual(metrics["Synthetic test accuracy"], f"{demo.test_accuracy:.1%}")
+        text = self.markdown_text(app)
+        self.assertIn(f"more than {model.distance_threshold:.2f} from every trained class", text)
+        self.assertIn(f"the top score is below {model.min_top_score:.2f}", text)
+        self.assertIn(
+            f"On {demo.test_windows:,} held-out windows of noise, BPSK, and QPSK, "
+            f"{demo.false_reject_rate:.1%} were answered uncertain; the other windows were "
+            f"{demo.accepted_accuracy:.1%} accurate.",
+            text,
+        )
+        (table,) = about.dataframe
+        self.assertEqual(list(table.value.iloc[:, 0]), list(PROBE_KINDS))
+        for snr, rates in demo.probe_flag_rates.items():
+            with self.subTest(snr=snr):
+                column = table.value[f"Answered uncertain at {snr:g} dB SNR"]
+                self.assertEqual(list(column), [f"{rates[kind]:.0%}" for kind in PROBE_KINDS])
+        captions = " ".join(caption.value for caption in about.caption)
+        self.assertIn("Neither the probes nor the held-out captures were used", captions)
+        self.assertIn("not validated unknown-signal detection", captions)
 
 
 if __name__ == "__main__":

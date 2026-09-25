@@ -25,21 +25,56 @@ open this folder and select `.venv/bin/python` as the Python interpreter.
 The app has three tabs:
 
 - **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR, carrier offset,
-  and random seed; inspect zoomable plots and the model scores. Download your
-  example as a CSV.
+  and random seed; inspect zoomable plots and the model's answer and scores.
+  Download your example as a CSV.
 - **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
-  samples (see the formats below) and inspect any complete 1,024-sample
-  window. The tab offers a fixed example CSV to download and upload as a first
-  try; the CSV from the first tab works too.
-- **How the model works:** inspect its grouped test accuracy and learn what the
-  synthetic score does and does not establish.
+  samples (see the formats below). Every complete 1,024-sample window is
+  classified: a timeline shows the answer for each window, a table counts the
+  answers, and you can download the per-window results (window number, first
+  sample, answer, reason, distance, and score per class) as a CSV. Windows that
+  cannot be classified, such as all-zero windows, are marked "not classifiable",
+  and the tab says how many trailing samples after the last complete window
+  were ignored. Below that, you can plot and score any single window. The tab
+  offers a fixed example CSV to download and upload as a first try; the CSV
+  from the first tab works too.
+- **How the model works:** inspect its grouped test accuracy, the limits behind
+  the "uncertain" answer and how often it fires, and learn what the synthetic
+  score does and does not establish.
 
 Each chart has a one- or two-sentence text summary directly below it with the
-numbers it shows, such as the model scores, the RMS of I and Q, and the
-strongest frequency bin. Score bars print their values, the Q line is dashed so
-I and Q never differ by color alone, the colors (Okabe-Ito blue and
-vermillion) stay distinct with color-vision deficiency, and every control has
-help text.
+numbers it shows, such as the model scores, the RMS of I and Q, the strongest
+frequency bin, and the runs of answers in the timeline. Score bars print their
+values, the Q line is dashed so I and Q never differ by color alone, timeline
+answers differ by row and marker shape, the colors (Okabe-Ito blue and
+vermillion, plus gray) stay distinct with color-vision deficiency, and every
+control has help text.
+
+### The "uncertain" answer
+
+The logistic regression always picks noise, BPSK, or QPSK, even for signals it
+never saw, and often with a score near 1: in our measurements, simulated 8PSK
+and 16-QAM at 10 dB SNR were called QPSK and an unmodulated tone was called
+BPSK. A low-score threshold alone therefore does not help. The app answers
+"uncertain" for either of two reasons:
+
+1. **Unlike the training data.** The window's standardized features are too far
+   from every trained class. Each class has a mean and a slightly shrunk
+   covariance, and the distance is the Mahalanobis distance to the nearest
+   class. A quarter of the training captures are held out of fitting, and the
+   limit is the 97.5th percentile of their distances.
+2. **Scores are close.** The top score is below 0.60. This weaker check
+   catches some windows between trained classes.
+
+The held-out test captures and the probe signals (8PSK, 16-QAM, and a tone,
+from `generate_probe_capture`) were never used to choose these settings; the
+app reports how often each is answered "uncertain". Expect about 5% of known
+test windows to be answered uncertain. In our measurements the tone was flagged
+at every SNR from -8 to 20 dB, 16-QAM mostly at 5 dB and above, and 8PSK only
+from about 10 dB; at 0 to 5 dB almost no 8PSK windows were flagged. Signals far
+below the training SNR range (for example -12 dB) are still mostly called
+noise, and known signals above it are often flagged. This is a simple
+heuristic tested only on synthetic probes, not validated unknown-signal
+detection.
 
 ### Supported upload formats
 
@@ -84,7 +119,9 @@ With the dependencies installed, run:
 
 The tests cover CSV validation and limits, lossless float64 interchange, the
 raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
-extreme amplitudes, and the chart summaries and other accessibility features.
+extreme amplitudes, the "uncertain" answer and its probe signals, whole-file
+classification and its CSV, and the chart summaries and other accessibility
+features.
 
 ## Run the command-line baseline
 
@@ -144,5 +181,6 @@ example run so you can compare its figures with your own output.
   commands, a CLI for one recording, and the limits of simulated evaluation.
 
 This project deliberately starts with three classes and a modest baseline.
-After it is reproducible, add 16-QAM, channel fading, and unknown-signal
-rejection as separate experiments.
+After it is reproducible, add 16-QAM, channel fading, and a better-tested
+unknown-signal check (new probe types, fresh seeds, and real recordings) as
+separate experiments.

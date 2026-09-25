@@ -14,6 +14,7 @@ from streamlit.testing.v1 import AppTest
 
 import iq_csv
 import iq_formats
+import spectrum_sense
 from spectrum_sense import SAMPLES_PER_WINDOW, generate_capture
 
 
@@ -68,21 +69,29 @@ class UploadCacheTests(unittest.TestCase):
         self.addCleanup(st.cache_data.clear)
 
     def start_app(self, payload: bytes):
-        """Start the app with a CSV upload and count calls to the file loader."""
+        """Start the app with a CSV upload and count calls to the file loader.
+
+        The whole-file classifier's call counter is kept in self.classifier, and
+        self.uploads is the list that the patched uploader returns.
+        """
         upload = BytesIO(payload)
         upload.name = "recording.csv"
-        uploader = patch("streamlit.file_uploader", return_value=[upload])
+        self.uploads = [upload]
+        uploader = patch("streamlit.file_uploader", return_value=self.uploads)
         parser = patch("iq_formats.load_uploads", wraps=iq_formats.load_uploads)
-        uploader.start()
-        self.addCleanup(uploader.stop)
-        counted_parser = parser.start()
-        self.addCleanup(parser.stop)
-        return AppTest.from_file(str(APP_PATH)).run(timeout=20), counted_parser
+        classifier = patch(
+            "spectrum_sense.classify_recording", wraps=spectrum_sense.classify_recording
+        )
+        for patcher in (uploader, parser, classifier):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.classifier = spectrum_sense.classify_recording
+        return AppTest.from_file(str(APP_PATH)).run(timeout=20), iq_formats.load_uploads
 
     def assert_no_exceptions(self, app):
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
 
-    def test_moving_the_window_slider_does_not_parse_again(self):
+    def test_moving_the_window_slider_does_not_parse_or_classify_again(self):
         capture, _, _ = generate_capture("QPSK", np.random.default_rng(5), windows=3)
         app, parser = self.start_app(iq_csv.to_csv(capture.ravel()).encode())
         self.assert_no_exceptions(app)
@@ -96,6 +105,20 @@ class UploadCacheTests(unittest.TestCase):
                     " ".join(caption.value for caption in app.caption),
                 )
         self.assertEqual(parser.call_count, 1)
+        self.assertEqual(self.classifier.call_count, 1)
+
+    def test_a_different_file_is_classified_again(self):
+        capture, _, _ = generate_capture("QPSK", np.random.default_rng(5), windows=3)
+        app, _ = self.start_app(iq_csv.to_csv(capture.ravel()).encode())
+        self.assert_no_exceptions(app)
+        self.assertIn("The timeline shows 3 windows", " ".join(c.value for c in app.caption))
+        shorter = BytesIO(iq_csv.to_csv(capture.ravel()[: 2 * SAMPLES_PER_WINDOW]).encode())
+        shorter.name = "recording.csv"
+        self.uploads[:] = [shorter]
+        app = app.run(timeout=20)
+        self.assert_no_exceptions(app)
+        self.assertIn("The timeline shows 2 windows", " ".join(c.value for c in app.caption))
+        self.assertEqual(self.classifier.call_count, 2)
 
     def test_invalid_upload_error_is_not_cached(self):
         payload = b"I,Q\nwrong,2\n" + b"1,2\n" * SAMPLES_PER_WINDOW

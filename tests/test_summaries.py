@@ -6,16 +6,26 @@ import warnings
 
 import numpy as np
 
-from signal_config import CLASSES, SAMPLES_PER_WINDOW
-from spectrum_sense import generate_capture
+from signal_config import (
+    CLASSES,
+    NOT_CLASSIFIABLE,
+    REASON_CLOSE_SCORES,
+    REASON_UNFAMILIAR,
+    SAMPLES_PER_WINDOW,
+    UNCERTAIN,
+)
+from spectrum_sense import Decision, decision_order, generate_capture
 from summaries import (
+    MAX_LISTED_RUNS,
     constellation_summary,
+    decision_summary,
     format_frequency,
     format_sample_rate,
     scores_summary,
     spectrum_db,
     spectrum_summary,
     time_summary,
+    timeline_summary,
 )
 
 
@@ -73,6 +83,72 @@ class ScoresSummaryTests(unittest.TestCase):
     def test_mismatched_lengths_are_rejected(self):
         with self.assertRaises(ValueError):
             scores_summary(CLASSES, [0.5, 0.5])
+
+
+class DecisionSummaryTests(unittest.TestCase):
+    def test_named_class(self):
+        self.assertEqual(
+            decision_summary(Decision("BPSK", None, "BPSK", 0.987, 2.34), 4.43, 0.6),
+            "The model names BPSK: the window is 2.3 from the nearest trained class "
+            "(limit 4.4) and the top score is 0.99 (minimum 0.60).",
+        )
+
+    def test_unlike_the_training_data(self):
+        decision = Decision(UNCERTAIN, REASON_UNFAMILIAR, "QPSK", 0.996, 12.06)
+        self.assertEqual(
+            decision_summary(decision, 4.43, 0.6),
+            "Uncertain because the window is unlike the training data: it is 12.1 from the "
+            "nearest trained class, beyond the limit of 4.4. The leading candidate is QPSK "
+            "with a score of 1.00.",
+        )
+
+    def test_scores_are_close(self):
+        decision = Decision(UNCERTAIN, REASON_CLOSE_SCORES, "noise", 0.52, 1.2)
+        self.assertEqual(
+            decision_summary(decision, 4.43, 0.6),
+            "Uncertain because the scores are close: the top score is 0.52, below the "
+            "minimum of 0.60. The leading candidate is noise with a score of 0.52.",
+        )
+
+
+class TimelineSummaryTests(unittest.TestCase):
+    ORDER = decision_order(CLASSES)
+
+    def test_single_window(self):
+        self.assertEqual(
+            timeline_summary(["QPSK"], self.ORDER), "The timeline shows 1 window: 1 QPSK."
+        )
+
+    def test_one_decision_throughout(self):
+        self.assertEqual(
+            timeline_summary(["noise"] * 4, self.ORDER),
+            "The timeline shows 4 windows: 4 noise. All windows have the same decision.",
+        )
+
+    def test_counts_follow_the_given_order_and_runs_are_listed(self):
+        labels = [UNCERTAIN, "BPSK", "BPSK", NOT_CLASSIFIABLE, "noise", "noise"]
+        self.assertEqual(
+            timeline_summary(labels, self.ORDER),
+            "The timeline shows 6 windows: 2 noise, 2 BPSK, 1 uncertain, 1 not classifiable. "
+            "In order, window 1: uncertain; windows 2 to 3: BPSK; window 4: not classifiable; "
+            "windows 5 to 6: noise.",
+        )
+
+    def test_many_changes_are_summarized_by_the_longest_run(self):
+        labels = ["BPSK", "QPSK"] * MAX_LISTED_RUNS + ["noise"] * 1500 + ["BPSK"] * 1500
+        self.assertEqual(
+            timeline_summary(labels, self.ORDER),
+            "The timeline shows 3,012 windows: 1,500 noise, 1,506 BPSK, 6 QPSK. The decision "
+            "changes 13 times; the longest run is windows 13 to 1,512 (noise).",
+        )
+
+    def test_labels_outside_the_order_are_listed_last(self):
+        text = timeline_summary(["mystery", "BPSK"], self.ORDER)
+        self.assertTrue(text.startswith("The timeline shows 2 windows: 1 BPSK, 1 mystery."), text)
+
+    def test_empty_timeline_is_rejected(self):
+        with self.assertRaises(ValueError):
+            timeline_summary([], self.ORDER)
 
 
 class TimeSummaryTests(SummaryTestCase):

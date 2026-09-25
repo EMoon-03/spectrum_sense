@@ -1,8 +1,9 @@
 """Plain-language text alternatives for the app's charts.
 
 Each summary is one or two sentences with the numbers a sighted reader takes
-from a chart. Summaries describe the samples; they never name a modulation.
-Only NumPy and the standard library are used.
+from a chart. Summaries of the samples never name a modulation; only summaries
+of the model's output name its classes. Only NumPy and the standard library
+are used.
 """
 
 from __future__ import annotations
@@ -12,10 +13,14 @@ import math
 
 import numpy as np
 
+from signal_config import REASON_UNFAMILIAR, UNCERTAIN
+
 
 _SI_SCALES = ((1e9, "G", "billion"), (1e6, "M", "million"), (1e3, "k", "thousand"))
 # Spectrum level added to every bin so silent bins stay finite in dB.
 SPECTRUM_FLOOR = 1e-8
+# The timeline summary lists at most this many runs of equal decisions.
+MAX_LISTED_RUNS = 6
 
 
 def _round_significant(value: float, digits: int) -> float:
@@ -178,4 +183,67 @@ def spectrum_summary(
     return (
         f"Spectrum of {bins}: the strongest bin is at {where}. "
         f"It is {above:.1f} dB above the median bin."
+    )
+
+
+def decision_summary(decision, distance_threshold: float, min_top_score: float) -> str:
+    """Explain a spectrum_sense.Decision: the answer, the reason for an
+    uncertain one, and the leading class with its score."""
+    distance = f"{decision.distance:.1f}"
+    if decision.label != UNCERTAIN:
+        return (
+            f"The model names {decision.label}: the window is {distance} from the nearest "
+            f"trained class (limit {distance_threshold:.1f}) and the top score is "
+            f"{decision.top_score:.2f} (minimum {min_top_score:.2f})."
+        )
+    if decision.reason == REASON_UNFAMILIAR:
+        why = (
+            f"the window is {decision.reason}: it is {distance} from the nearest trained "
+            f"class, beyond the limit of {distance_threshold:.1f}"
+        )
+    else:
+        why = (
+            f"the {decision.reason}: the top score is {decision.top_score:.2f}, below "
+            f"the minimum of {min_top_score:.2f}"
+        )
+    return (
+        f"Uncertain because {why}. The leading candidate is {decision.leading} "
+        f"with a score of {decision.top_score:.2f}."
+    )
+
+
+def _windows(count: int) -> str:
+    return f"{count:,} window" + ("" if count == 1 else "s")
+
+
+def _span(first: int, last: int) -> str:
+    return f"window {first:,}" if first == last else f"windows {first:,} to {last:,}"
+
+
+def timeline_summary(labels: Sequence[str], order: Sequence[str]) -> str:
+    """Describe the decision timeline: how many windows got each decision
+    (listed in the given order) and where the decision changes."""
+    labels = [str(label) for label in labels]
+    if not labels:
+        raise ValueError("The timeline needs at least one window.")
+    runs: list[list] = []  # [decision, first window, last window], numbered from 1
+    for number, label in enumerate(labels, start=1):
+        if runs and runs[-1][0] == label:
+            runs[-1][2] = number
+        else:
+            runs.append([label, number, number])
+    names = [*(name for name in order if name in labels), *sorted(set(labels) - set(order))]
+    counts = ", ".join(f"{labels.count(name):,} {name}" for name in names)
+    text = f"The timeline shows {_windows(len(labels))}: {counts}."
+    if len(labels) == 1:
+        return text
+    if len(runs) == 1:
+        return text + " All windows have the same decision."
+    if len(runs) <= MAX_LISTED_RUNS:
+        listed = "; ".join(f"{_span(first, last)}: {label}" for label, first, last in runs)
+        return f"{text} In order, {listed}."
+    label, first, last = max(runs, key=lambda run: run[2] - run[1])  # The first longest run.
+    return (
+        f"{text} The decision changes {len(runs) - 1:,} times; the longest run is "
+        f"{_span(first, last)} ({label})."
     )
