@@ -25,6 +25,15 @@ MAX_LISTED_RUNS = 6
 # The spectrogram summary calls the overall level steady when every time step
 # is within this many dB of the loudest one (3 dB is half the power).
 STEADY_LEVEL_DB = 3.0
+# A time step has a clear peak when its strongest bin is at least this many dB
+# above the step's median bin. Noise alone rarely reaches it.
+CLEAR_PEAK_DB = 12.0
+# The strongest frequency counts as moving when it changes by more than this
+# share of the band. BPSK and QPSK spread over about a quarter of the band, so
+# their strongest bin wanders by less than this from one time step to the next.
+PEAK_MOVE_SHARE = 1 / 8
+# The most decimal places used to tell a value from the limit it is compared with.
+MAX_DECIMALS = 12
 
 
 def _round_significant(value: float, digits: int) -> float:
@@ -228,14 +237,89 @@ def _time_step_position(spectrogram: Spectrogram, row: int, sample_rate: float |
     return f"sample {math.floor(center + 0.5):,}"
 
 
+def _lower_median(values: Sequence[int]) -> int:
+    """The median of whole numbers, taking the lower middle value, so it is a bin."""
+    return sorted(values)[(len(values) - 1) // 2]
+
+
+def _peak_track(spectrogram: Spectrogram, sample_rate: float | None) -> str:
+    """Describe how the strongest frequency of each time step changes: whether
+    it stays put, moves gradually (a sweep), or jumps (for example, hops)."""
+    power = spectrogram.power
+    steps, bins = power.shape
+    peaks = power.argmax(axis=1)
+    peak_power = power[np.arange(steps), peaks]
+    clear = (peak_power > 0) & (
+        peak_power >= np.median(power, axis=1) * 10 ** (CLEAR_PEAK_DB / 10)
+    )
+    track = [int(peak) for peak in peaks[clear]]
+    count = len(track)
+    rule = f"a bin at least {CLEAR_PEAK_DB:g} dB above the step's median bin"
+    if count == 0:
+        return f" No time step has a clear strongest frequency ({rule})."
+    if 2 * count < steps:
+        return (
+            f" Most time steps have no clear strongest frequency: only {count:,} of "
+            f"{steps:,} {'has' if count == 1 else 'have'} {rule}."
+        )
+    if count == steps:
+        lead = " The strongest frequency of each time step"
+    else:
+        lead = (
+            f" In the {count:,} of {steps:,} time steps with a clear peak ({rule}), "
+            "the strongest frequency"
+        )
+
+    def where(position: int) -> str:
+        return _frequency_phrase(float(spectrogram.frequencies[position]), sample_rate, None)
+
+    move = max(1, int(bins * PEAK_MOVE_SHARE))
+    ordered = sorted(track)
+    low, high = ordered[count // 10], ordered[(9 * count) // 10]
+    if high - low <= move:
+        verb = "stays at" if ordered[0] == ordered[-1] else "stays near"
+        return f"{lead} {verb} {where(_lower_median(track))}."
+
+    third = -(-count // 3)  # At least one time step.
+    start = _lower_median(track[:third])
+    middle = _lower_median(track[count // 3 : count - count // 3])
+    end = _lower_median(track[-third:])
+    jumps = sum(abs(after - before) > move for before, after in zip(track, track[1:]))
+    if jumps == 0:
+        return (
+            f"{lead} moves gradually: it is {where(start)} near the start, "
+            f"{where(middle)} in the middle, and {where(end)} near the end."
+        )
+    groups = [[ordered[0]]]
+    for position in ordered[1:]:
+        if position - groups[-1][-1] > move:
+            groups.append([])
+        groups[-1].append(position)
+    if len(groups) == 2:
+        if track[0] in groups[1]:
+            groups.reverse()
+        first, second = (_lower_median(group) for group in groups)
+        if jumps == 1:
+            return f"{lead} changes abruptly once, from {where(first)} to {where(second)}."
+        return (
+            f"{lead} switches abruptly {jumps:,} times between {where(first)} "
+            f"and {where(second)}."
+        )
+    return (
+        f"{lead} changes abruptly {jumps:,} times: it is {where(start)} near the start, "
+        f"{where(middle)} in the middle, and {where(end)} near the end."
+    )
+
+
 def spectrogram_summary(
     spectrogram: Spectrogram,
     sample_rate: float | None = None,
     center_frequency: float | None = None,
 ) -> str:
     """Describe the spectrogram: its layout, the strongest frequency of the
-    time-averaged spectrum, and how much the overall level changes between
-    time steps. Every number comes from the plotted power.
+    time-averaged spectrum, how the strongest frequency of each time step
+    changes, and how much the overall level changes between time steps. Every
+    number comes from the plotted power.
     """
     power = spectrogram.power
     steps, bins = power.shape
@@ -283,6 +367,7 @@ def spectrogram_summary(
     if steps == 1:
         return text
 
+    text += _peak_track(spectrogram, sample_rate)
     totals = power.sum(axis=1)
     loudest, quietest = int(np.argmax(totals)), int(np.argmin(totals))
     change = round(_decibels_below(float(totals[quietest] / totals[loudest])), 1)
@@ -298,29 +383,49 @@ def spectrogram_summary(
     )
 
 
+def format_against_limit(value: float, limit: float, decimals: int = 2) -> tuple[str, str]:
+    """A value and the limit it is compared with, each with the given number of
+    decimal places, or with more when the two differ but would print the same.
+
+    Rounding never reverses their order, so a value past a limit never appears
+    equal to it: 0.597 and 0.6 print as "0.597" and "0.600", not "0.60" twice.
+    """
+    for places in range(decimals, MAX_DECIMALS + 1):
+        shown, bound = f"{value:.{places}f}", f"{limit:.{places}f}"
+        if shown != bound or value == limit:
+            break
+    return shown, bound
+
+
 def decision_summary(decision, distance_threshold: float, min_top_score: float) -> str:
     """Explain a spectrum_sense.Decision: the answer, the reason for an
-    uncertain one, and the leading class with its score."""
-    distance = f"{decision.distance:.1f}"
+    uncertain one, and the leading class with its score.
+
+    Limits have two decimal places, as in the About tab, and each value has
+    enough places to differ from the limit it is compared with.
+    """
+    distance, distance_limit = format_against_limit(decision.distance, distance_threshold)
+    score, score_minimum = format_against_limit(decision.top_score, min_top_score)
     if decision.label != UNCERTAIN:
         return (
             f"The model names {decision.label}: the window is {distance} from the nearest "
-            f"trained class (limit {distance_threshold:.1f}) and the top score is "
-            f"{decision.top_score:.2f} (minimum {min_top_score:.2f})."
+            f"trained class (limit {distance_limit}) and the top score is {score} "
+            f"(minimum {score_minimum})."
         )
     if decision.reason == REASON_UNFAMILIAR:
+        score = f"{decision.top_score:.2f}"  # Not compared with the minimum here.
         why = (
             f"the window is {decision.reason}: it is {distance} from the nearest trained "
-            f"class, beyond the limit of {distance_threshold:.1f}"
+            f"class, beyond the limit of {distance_limit}"
         )
     else:
         why = (
-            f"the {decision.reason}: the top score is {decision.top_score:.2f}, below "
-            f"the minimum of {min_top_score:.2f}"
+            f"the {decision.reason}: the top score is {score}, below the minimum of "
+            f"{score_minimum}"
         )
     return (
         f"Uncertain because {why}. The leading candidate is {decision.leading} "
-        f"with a score of {decision.top_score:.2f}."
+        f"with a score of {score}."
     )
 
 

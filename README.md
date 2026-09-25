@@ -88,9 +88,10 @@ The app has three tabs:
   bookmark or share the exact example. A link's values are checked when it
   opens: numbers outside a control's range or between its steps move to the
   nearest allowed value, anything else falls back to the default, and a short
-  note lists what changed. Each change also adds a browser history entry;
-  going back changes the address but not the controls, so reload the page to
-  open an earlier address.
+  note lists what changed. Each change also adds a browser history entry, but
+  the Back and Forward buttons change only the address, not the example; the
+  app says so next to its sharing hint. Change a control to update the address,
+  or reload the page to open the address shown.
 - **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
   samples (see the formats below). Every complete 1,024-sample window is
   classified: a timeline shows the answer for each window, a table counts the
@@ -105,22 +106,27 @@ The app has three tabs:
   drawn, and gives levels in dB relative to the strongest cell, with a floor
   of -80 dB. Below that, you can plot and score any single window. The tab
   offers a fixed example CSV to download and upload as a first try; the CSV
-  from the first tab works too.
+  from the first tab works too. The uploader keeps earlier files when you add
+  more, so the app reads the most recently added recording (one file, or a
+  SigMF pair) and says how many earlier files it ignored.
 - **How the model works:** inspect its grouped test accuracy, the limits behind
-  the "uncertain" answer and how often it fires, and learn what the synthetic
-  score does and does not establish.
+  the "uncertain" answer and how often it fires, overall and by SNR band, and
+  learn what the synthetic score does and does not establish.
 
 ### Accessibility
 
 Each chart has a short text summary directly below it with the numbers it
 shows, such as the model scores, the RMS of I and Q, the strongest frequency
-bin, the runs of answers in the timeline, and how much the spectrogram's level
-changes over time. Score bars print their values, the Q line is dashed so I and
-Q never differ by color alone, timeline answers differ by row and marker shape,
-the colors (Okabe-Ito blue and vermillion, plus gray) stay distinct with
-color-vision deficiency, and every control has help text. The spectrogram uses
-the Cividis color scale, which grows steadily lighter with level, has a labeled
-color bar, and shows each cell's level on hover.
+bin, the runs of answers in the timeline, and whether the spectrogram's
+strongest frequency stays put, moves gradually (a sweep), or jumps (hops), and
+how much its level changes over time. Summaries are ordinary body text rather
+than Streamlit captions, whose faded gray falls below the WCAG contrast
+minimum on the light theme. Score bars print their values, the Q line is dashed
+so I and Q never differ by color alone, timeline answers differ by row and
+marker shape, the colors (Okabe-Ito blue and vermillion, plus gray) stay
+distinct with color-vision deficiency, and every control has help text. The
+spectrogram uses the Cividis color scale, which grows steadily lighter with
+level, has a labeled color bar, and shows each cell's level on hover.
 
 ### The "uncertain" answer
 
@@ -140,14 +146,25 @@ BPSK. A low-score threshold alone therefore does not help. The app answers
 
 The held-out test captures and the probe signals (8PSK, 16-QAM, and a tone,
 from `generate_probe_capture`) were never used to choose these settings; the
-app reports how often each is answered "uncertain". Expect about 5% of known
-test windows to be answered uncertain. In our measurements the tone was flagged
-at every SNR from -8 to 20 dB, 16-QAM mostly at 5 dB and above, and 8PSK only
-from about 10 dB; at 0 to 5 dB almost no 8PSK windows were flagged. Signals far
-below the training SNR range (for example -12 dB) are still mostly called
-noise, and known signals above it are often flagged. This is a simple
-heuristic tested only on synthetic probes, not validated unknown-signal
-detection.
+app reports how often each is answered "uncertain". About 5% of known test
+windows are answered uncertain on average, but the rate depends on SNR, and
+the About tab lists it for each SNR band. Uncertain answers and errors are most
+common near the bottom of the training range: at -2 dB, about three in four
+BPSK examples in the Explore tab are answered uncertain, and some of the rest
+are called QPSK.
+
+We measured the demo model every 2 dB with 100 windows per signal type and SNR.
+Within the training range (-2 to 14 dB), the tone was flagged in nearly all
+windows at every SNR, 16-QAM in most windows from 4 dB, and 8PSK only from
+about 10 dB (roughly 60% of windows at 10 dB, nearly all from 12 dB); at 0 to 6
+dB almost no 8PSK windows were flagged. Outside the range, a flag says little
+about the signal type. From -8 to -4 dB nearly every window is answered
+uncertain, known BPSK and QPSK included, mostly because that much noise makes a
+window unlike the training data; at -12 dB most windows of every type except
+the tone are called noise. Known signals above the range are often flagged too:
+most BPSK and QPSK windows at 20 dB. `tests/test_uncertain.py` repeats these
+measurements. This is a simple heuristic tested only on synthetic probes, not
+validated unknown-signal detection.
 
 ### Supported upload formats
 
@@ -168,7 +185,9 @@ frequency when the metadata includes them. Raw files carry no metadata. Either
 way, the demo model assumes its own synthetic timing of 8 samples per symbol,
 so a file's sample rate does not change what the model expects. Archives are
 read in memory and never extracted; links, special files, and unsafe paths are
-rejected. NumPy files are loaded without pickle support.
+rejected, and the `._` files that macOS `tar` adds are ignored. NumPy files
+are loaded without pickle support. Error messages describe a problem without
+repeating text from the file, such as names inside an archive.
 
 Most SDR captures hold far more than 100,000 samples. Trim a raw file before
 uploading it; for example, `head -c 400000 capture.cs16 > short.cs16` keeps the
@@ -193,8 +212,9 @@ With the dependencies installed, run:
 The tests cover CSV validation and limits, lossless float64 interchange, the
 raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
 extreme amplitudes, the "uncertain" answer and its probe signals, whole-file
-classification and its CSV, the spectrogram, the shareable Explore links, and
-the chart summaries and other accessibility features. The app tests run it
+classification and its CSV, the spectrogram, the shareable Explore links, the
+measured SNR behaviour described above, damaged and hostile files, and the
+chart summaries and other accessibility features. The app tests run it
 headless with Streamlit's `AppTest`, so no browser is needed.
 
 GitHub Actions runs the same tests on Python 3.10 and 3.12 for every push and

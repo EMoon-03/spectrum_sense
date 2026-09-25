@@ -1,5 +1,6 @@
 """Tests for the "uncertain" answer, the probe signals, and whole-file classification."""
 
+from collections import Counter
 import csv
 from io import StringIO
 import math
@@ -25,6 +26,7 @@ from signal_config import (
 from spectrum_sense import (
     Decision,
     FileClassification,
+    GroupRates,
     build_demo_model,
     classify_features,
     classify_recording,
@@ -38,6 +40,7 @@ from spectrum_sense import (
     generate_probe_capture,
     make_dataset,
     novelty_distance,
+    rates_by_snr,
     results_csv,
     train_classifier,
     uncertain_rates,
@@ -239,6 +242,44 @@ class RatesTests(unittest.TestCase):
                     uncertain_rates([Decision("BPSK", None, "BPSK", 0.9, 1.0)], truth)
 
 
+class RatesBySnrTests(unittest.TestCase):
+    def test_signal_windows_by_snr_band_then_noise(self):
+        rows = [
+            (-1.0, "BPSK", Decision(UNCERTAIN, REASON_CLOSE_SCORES, "BPSK", 0.5, 1.0)),
+            (0.5, "QPSK", Decision("QPSK", None, "QPSK", 0.9, 1.0)),
+            (1.9, "BPSK", Decision("QPSK", None, "QPSK", 0.9, 1.0)),
+            (-2.0, "QPSK", Decision("QPSK", None, "QPSK", 0.9, 1.0)),
+            (14.0, "BPSK", Decision("BPSK", None, "BPSK", 0.9, 1.0)),  # The top edge counts.
+            (math.nan, "noise", Decision("noise", None, "noise", 0.9, 1.0)),
+            (math.nan, "noise", Decision(UNCERTAIN, REASON_UNFAMILIAR, "noise", 0.9, 9.0)),
+        ]
+        snrs, truth, decisions = zip(*rows)
+        self.assertEqual(
+            rates_by_snr(decisions, truth, snrs),
+            (
+                GroupRates("BPSK and QPSK at -2 to 2 dB SNR", 4, 0.25, 2 / 3),
+                GroupRates("BPSK and QPSK at 10 to 14 dB SNR", 1, 0.0, 1.0),
+                GroupRates("Noise (no SNR)", 2, 0.5, 1.0),
+            ),
+        )
+
+    def test_a_group_answered_only_uncertain_has_no_accuracy(self):
+        (rates,) = rates_by_snr(
+            [Decision(UNCERTAIN, REASON_UNFAMILIAR, "BPSK", 0.9, 9.0)], ["BPSK"], [7.0]
+        )
+        self.assertEqual((rates.group, rates.windows, rates.false_reject_rate), (
+            "BPSK and QPSK at 6 to 10 dB SNR", 1, 1.0
+        ))
+        self.assertTrue(math.isnan(rates.accepted_accuracy))
+
+    def test_lengths_must_match(self):
+        decision = Decision("BPSK", None, "BPSK", 0.9, 1.0)
+        for truth, snrs in ((["BPSK"], []), ([], [1.0]), (["BPSK", "QPSK"], [1.0, 2.0])):
+            with self.subTest(truth=truth, snrs=snrs):
+                with self.assertRaises(ValueError):
+                    rates_by_snr([decision], truth, snrs)
+
+
 class TrainClassifierTests(unittest.TestCase):
     def test_calibration_captures_are_separate_and_set_the_threshold(self):
         windows, labels, groups, _, _ = make_dataset(np.random.default_rng(3), 20, 4)
@@ -276,6 +317,22 @@ class DemoModelTests(unittest.TestCase):
             self.assertTrue(all(0 <= rate <= 1 for rate in rates.values()))
         self.assertEqual(demo.probe_windows, 100)
 
+    def test_rates_by_snr_cover_every_held_out_window(self):
+        demo = self.demo
+        groups = demo.rates_by_snr
+        self.assertEqual(sum(rates.windows for rates in groups), demo.test_windows)
+        self.assertAlmostEqual(
+            sum(rates.windows * rates.false_reject_rate for rates in groups) / demo.test_windows,
+            demo.false_reject_rate,
+        )
+        self.assertEqual(groups[-1].group, "Noise (no SNR)")
+        # The About tab says uncertain answers and errors are most common near
+        # the bottom of the training range.
+        signal = groups[:-1]
+        self.assertTrue(signal[0].group.startswith(f"BPSK and QPSK at {SNR_DB_RANGE[0]:g} to"))
+        self.assertEqual(signal[0].false_reject_rate, max(r.false_reject_rate for r in signal))
+        self.assertEqual(signal[0].accepted_accuracy, min(r.accepted_accuracy for r in signal))
+
     def test_rebuilding_gives_the_same_model(self):
         again = build_demo_model()
         self.assertEqual(again.model.distance_threshold, self.demo.model.distance_threshold)
@@ -291,6 +348,72 @@ class DemoModelTests(unittest.TestCase):
         self.assertGreater(np.mean(scores.max(axis=1) >= MIN_TOP_SCORE), 0.9)
         self.assertGreater(np.mean([item.leading == "BPSK" for item in decisions]), 0.9)
         self.assertGreater(np.mean([item.reason == REASON_UNFAMILIAR for item in decisions]), 0.9)
+
+
+class SnrBehaviourTests(unittest.TestCase):
+    """How "uncertain" behaves with SNR, as the README and the About tab
+    describe it. Each point uses 25 captures of 4 windows from a fixed seed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = build_demo_model().model
+
+    def outcomes(self, kind: str, snr_db: float) -> Counter:
+        """How the demo model answers 100 windows of a trained class or probe."""
+        rng = np.random.default_rng(1234)
+        if kind in PROBE_KINDS:
+            captures = [generate_probe_capture(kind, rng, 4, snr_db=snr_db) for _ in range(25)]
+        else:
+            captures = [generate_capture(kind, rng, 4, snr_db_override=snr_db)[0] for _ in range(25)]
+        features = np.vstack([extract_features(window) for window in np.vstack(captures)])
+        _, decisions = classify_features(self.model, features)
+        return Counter(item.label for item in decisions)
+
+    def share(self, kind: str, snr_db: float, label: str = UNCERTAIN) -> float:
+        return self.outcomes(kind, snr_db)[label] / 100
+
+    def test_probes_inside_the_training_range(self):
+        for snr in range(-2, 15, 2):
+            with self.subTest(snr=snr):
+                self.assertGreaterEqual(self.share("tone", snr), 0.95)
+                if snr >= 4:
+                    self.assertGreater(self.share("16-QAM", snr), 0.5)
+        for snr in (0, 2, 4, 6):
+            with self.subTest(kind="8PSK", snr=snr):
+                self.assertLessEqual(self.share("8PSK", snr), 0.1)
+        self.assertTrue(0.4 <= self.share("8PSK", 10) <= 0.8)  # "Roughly 60%".
+        for snr in (12, 14):
+            with self.subTest(kind="8PSK", snr=snr):
+                self.assertGreaterEqual(self.share("8PSK", snr), 0.95)
+
+    def test_below_the_training_range_flags_say_nothing_about_signal_type(self):
+        for kind in ("BPSK", "QPSK", *PROBE_KINDS):
+            for snr in (-8, -6, -4):
+                with self.subTest(kind=kind, snr=snr):
+                    self.assertGreaterEqual(self.share(kind, snr), 0.8)
+            if kind != "tone":
+                with self.subTest(kind=kind, snr=-12):
+                    self.assertGreater(self.share(kind, -12, "noise"), 0.7)
+
+    def test_known_signals_above_the_training_range_are_often_flagged(self):
+        for kind in ("BPSK", "QPSK"):
+            with self.subTest(kind=kind):
+                self.assertGreater(self.share(kind, 20), 0.5)
+
+    def test_bpsk_at_the_bottom_of_the_range_in_the_explore_tab(self):
+        # The Explore tab makes one window from the seed, with no carrier offset
+        # unless the user sets one.
+        answers = []
+        for seed in range(100):
+            capture, _, _ = generate_capture(
+                "BPSK", np.random.default_rng(seed), windows=1,
+                snr_db_override=SNR_DB_RANGE[0], freq_offset_override=0.0,
+            )
+            _, (decision,) = classify_features(self.model, extract_features(capture[0]))
+            answers.append(decision.label)
+        uncertain = answers.count(UNCERTAIN) / len(answers)
+        self.assertTrue(0.6 <= uncertain <= 0.9, uncertain)  # "About three in four".
+        self.assertGreater(answers.count("QPSK"), 0)  # "Some of the rest are called QPSK".
 
 
 class ClassifyRecordingTests(unittest.TestCase):

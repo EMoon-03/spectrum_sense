@@ -23,12 +23,15 @@ from iq_formats import MAX_FILE_BYTES, load_uploads
 from signal_config import (
     NOT_CLASSIFIABLE,
     PROBE_KINDS,
+    REASON_CLOSE_SCORES,
     SAMPLES_PER_SYMBOL,
     SAMPLES_PER_WINDOW,
+    SNR_DB_RANGE,
     UNCERTAIN,
 )
 from spectrogram import FLOOR_DB, MAX_TIME_STEPS, SEGMENT_LENGTH, compute_spectrogram
 from spectrum_sense import (
+    FileClassification,
     build_demo_model,
     classify_recording,
     decision_counts,
@@ -45,8 +48,12 @@ CAN_UPLOAD = hasattr(getattr(element_tree, "FileUploader", None), "set_value")
 EXAMPLE_LABEL = "Download an example CSV"
 RESULTS_LABEL = "Download per-window results as CSV"
 LAB_DOWNLOAD_LABEL = "Download this I/Q example as CSV"
-SHARE_HINT = "To share this exact example, copy the address from your browser's address bar."
+UPLOADER_LABEL = "Choose a recording (or a .sigmf-meta and .sigmf-data pair)"
+SHARE_HINT_START = "**To share this exact example,** copy the address from your browser's address bar."
 LINK_NOTE_START = "Part of this link could not be used as given:"
+ABOUT_HEADER = "What you are testing"
+# Text a shared file could carry to make the app's error box show a link.
+HOSTILE_TEXT = "![](https://e.example/p.png)[Get the fixed file](https://e.example)"
 # The text summary that must sit directly under each chart, by chart key.
 SUMMARY_STARTS = {
     "scores": "Scores: ",
@@ -94,13 +101,27 @@ def ordered_children(block) -> list:
     return [block.children[index] for index in sorted(block.children)]
 
 
-def sigmf_archive(meta: bytes, data: bytes) -> bytes:
+def sigmf_archive(meta: bytes, data: bytes, data_pax_headers: dict | None = None) -> bytes:
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for name, payload in (("rec/rec.sigmf-meta", meta), ("rec/rec.sigmf-data", data)):
             info = tarfile.TarInfo(name)
             info.size = len(payload)
+            if name.endswith("data") and data_pax_headers:
+                info.pax_headers = data_pax_headers
             archive.addfile(info, BytesIO(payload))
+    return buffer.getvalue()
+
+
+def symlink_archive(name: str) -> bytes:
+    """A GNU tar archive whose only member is a link with this name; a lone
+    surrogate in the name is written as the original non-UTF-8 byte."""
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.SYMTYPE
+        info.linkname = "elsewhere"
+        archive.addfile(info)
     return buffer.getvalue()
 
 
@@ -135,14 +156,17 @@ class AppTestCase(unittest.TestCase):
         return app, downloads
 
     def chart_summaries(self, block) -> dict[str, str]:
-        """Map each chart's key to the caption directly below it."""
+        """Map each chart's key to the text directly below it, which must be body
+        text: Streamlit fades a caption to 3.7:1 contrast in its light theme,
+        below the 4.5:1 that WCAG asks of text."""
         found = {}
         children = ordered_children(block)
         for position, child in enumerate(children):
             if child.type == "plotly_chart":
                 chart_key = child.proto.id.split("-", 2)[2]
                 following = children[position + 1] if position + 1 < len(children) else None
-                self.assertEqual(getattr(following, "type", None), "caption", chart_key)
+                # AppTest gives captions the type "caption".
+                self.assertEqual(getattr(following, "type", None), "markdown", chart_key)
                 found[chart_key] = following.value
             elif hasattr(child, "children"):
                 found.update(self.chart_summaries(child))
@@ -166,6 +190,17 @@ class AppTestCase(unittest.TestCase):
     @staticmethod
     def markdown_text(app) -> str:
         return " ".join(item.value for item in app.markdown)
+
+    def assert_one_plain_error(self, app) -> str:
+        """The run showed one error and still reached the last tab, and the
+        error shows no link or text that could not be sent to a browser."""
+        self.assertEqual(len(app.error), 1, [item.value for item in app.error])
+        self.assertIn(ABOUT_HEADER, [item.value for item in app.header])
+        message = app.error[0].value
+        message.encode("utf-8")  # A lone surrogate would raise here.
+        self.assertNotIn("](", message)
+        self.assertEqual(self.uploaded_charts(app), set())
+        return message
 
     @staticmethod
     def uploaded_charts(app):
@@ -295,8 +330,8 @@ class AppTests(AppTestCase):
         for uploads, message in (
             ([("capture.cu8", bytes(2 * SAMPLES_PER_WINDOW + 1))], "whole number"),
             ([("rec.sigmf", b"not a tar archive" * 100)], "could not be read"),
-            ([("a.csv", csv), ("b.csv", csv)], "2 files were uploaded"),
-            ([("rec.sigmf-meta", b"{}")], "needs both files"),
+            ([("a.csv", csv), ("rec.sigmf-meta", b"{}")], "needs both files"),
+            ([("a.sigmf-meta", b"{}"), ("b.sigmf-data", csv)], "different names"),
         ):
             with self.subTest(names=[name for name, _ in uploads]):
                 app = self.run_app(*uploads)
@@ -304,6 +339,94 @@ class AppTests(AppTestCase):
                 self.assertIn(message, app.error[0].value)
                 self.assertIn(EXAMPLE_LABEL, app.error[0].value)
                 self.assertEqual(self.uploaded_charts(app), set())
+
+    def test_file_text_never_breaks_or_formats_the_error(self):
+        # A lone surrogate made st.error raise, so the page silently stopped at
+        # the upload tab; Markdown in the text became a clickable link.
+        data = np.ones(2 * SAMPLES_PER_WINDOW, dtype=np.complex64).tobytes()
+        structured = BytesIO()
+        np.save(structured, np.zeros(SAMPLES_PER_WINDOW, dtype=[(HOSTILE_TEXT, "<f4")]))
+        for label, uploads, message in (
+            (
+                "surrogate datatype",
+                [("r.sigmf-meta", b'{"global": {"core:datatype": "\\ud800"}}'), ("r.sigmf-data", data)],
+                "not a valid SigMF datatype",
+            ),
+            (
+                "Markdown datatype",
+                [("r.sigmf-meta", json.dumps({"global": {"core:datatype": HOSTILE_TEXT}}).encode()),
+                 ("r.sigmf-data", data)],
+                "not a valid SigMF datatype",
+            ),
+            ("non-UTF-8 member name", [("r.sigmf", symlink_archive("rec/\udcff.sigmf-data"))],
+             "link or special file"),
+            ("Markdown member name", [("r.sigmf", symlink_archive(HOSTILE_TEXT))], "link or special file"),
+            (
+                "size too large for tarfile",
+                [("r.sigmf", sigmf_archive(json.dumps({"global": {"core:datatype": "cf32_le"}}).encode(),
+                                           data, {"size": str(2**63)}))],
+                "could not be read",
+            ),
+            ("structured .npy", [("r.npy", structured.getvalue())], "structured array"),
+        ):
+            with self.subTest(label):
+                app = self.run_app(*uploads)
+                self.assertIn(message, self.assert_one_plain_error(app))
+
+    def test_error_text_is_shown_literally(self):
+        # Whatever a reader's message holds, st.error shows it as plain text.
+        hostile = f"Bad \ud800 file. {HOSTILE_TEXT} **bold** :material/home: $x$ <b>"
+        with patch("iq_formats.load_uploads", side_effect=ValueError(hostile)):
+            app = self.run_app(("r.csv", b"I,Q\n"))
+        message = self.assert_one_plain_error(app)
+        self.assertIn("\\ud800", message)
+        for escaped in (r"\*\*bold\*\*", r"\:material\/home\:", r"\$x\$", r"\<b\>", r"\[Get"):
+            self.assertIn(escaped, message)
+        self.assertIn(f"**{EXAMPLE_LABEL}**", message)  # The app's own tip keeps its formatting.
+
+    def test_the_latest_upload_is_read_and_earlier_ones_are_noted(self):
+        # The uploader adds each choice to its list, as when a user uploads the
+        # example and then the CSV from the Explore tab.
+        one = to_csv(generate_capture("BPSK", np.random.default_rng(1), windows=1)[0].ravel())
+        two = to_csv(generate_capture("QPSK", np.random.default_rng(2), windows=2)[0].ravel())
+        capture, _, _ = generate_capture("QPSK", np.random.default_rng(12), windows=3)
+        meta, data = sigmf_files(capture.ravel())
+        for uploads, samples, ignored in (
+            ([("a.csv", one.encode()), ("b.csv", two.encode())], 2, "1 earlier file was"),
+            (
+                [("a.csv", one.encode()), ("b.csv", two.encode()), ("rec.sigmf-meta", meta),
+                 ("rec.sigmf-data", data)],
+                3,
+                "2 earlier files were",
+            ),
+        ):
+            with self.subTest(names=[name for name, _ in uploads]):
+                app = self.run_app(*uploads)
+                self.assertEqual(len(app.error), 0)
+                self.assertIn(f"**Samples:** {samples * SAMPLES_PER_WINDOW:,}", self.markdown_text(app))
+                notes = " ".join(item.value for item in app.info)
+                self.assertIn(f"Only the most recently added recording is read, so {ignored} ignored", notes)
+                self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
+        app = self.run_app(("b.csv", two.encode()))
+        self.assertNotIn("most recently added", " ".join(item.value for item in app.info))
+
+    @unittest.skipUnless(CAN_UPLOAD, "AppTest cannot upload files in this Streamlit version.")
+    def test_real_uploader_reads_the_file_added_last(self):
+        example = self.example_csv().encode()
+        lab = to_csv(generate_capture("QPSK", np.random.default_rng(3), windows=1)[0].ravel())
+        app = AppTest.from_file(str(APP_PATH)).run(timeout=20)
+        app.file_uploader[0].set_value(
+            [
+                ("spectrum_sense_upload_example.csv", example, "text/csv"),
+                ("spectrum_sense_example.csv", lab.encode(), "text/csv"),
+            ]
+        )
+        app = app.run(timeout=20)
+        self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
+        self.assertEqual(len(app.error), 0)
+        self.assertIn(f"**Samples:** {SAMPLES_PER_WINDOW:,}", self.markdown_text(app))
+        self.assertIn("1 earlier file was ignored", " ".join(item.value for item in app.info))
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
 
     @unittest.skipUnless(CAN_UPLOAD, "AppTest cannot upload files in this Streamlit version.")
     def test_real_uploader_accepts_a_sigmf_pair_and_keeps_it_across_reruns(self):
@@ -386,13 +509,17 @@ class AccessibilityTests(AppTestCase):
 
     def test_every_input_widget_has_help_text(self):
         app = self.run_csv(self.example_csv().encode())
+        # run_csv replaces the uploader, so check the real one in a separate run.
+        real = AppTest.from_file(str(APP_PATH)).run(timeout=20)
+        self.assertEqual(len(real.exception), 0, [item.message for item in real.exception])
         widgets = [
-            *app.selectbox, *app.slider, *app.number_input, *app.file_uploader,
+            *app.selectbox, *app.slider, *app.number_input, *real.get("file_uploader"),
             *app.get("download_button"),
         ]
         labels = [widget.proto.label for widget in widgets]
         for label in (
             "Signal type", "Example seed", "Window to inspect", EXAMPLE_LABEL, RESULTS_LABEL,
+            UPLOADER_LABEL,
         ):
             self.assertIn(label, labels)
         for widget in widgets:
@@ -490,8 +617,8 @@ class ShareableUrlTests(AppTestCase):
         self.assertEqual(self.controls(app), ("QPSK", 3.0, 0.012, 7))
         self.assertEqual(downloads[LAB_DOWNLOAD_LABEL], example)
         lab = app.tabs[0]
-        self.assertIn(SHARE_HINT, [caption.value for caption in lab.caption])
-        self.assertIn("Actual simulated type: **QPSK**", " ".join(c.value for c in lab.caption))
+        self.assertIn(SHARE_HINT_START, " ".join(item.value for item in lab.markdown))
+        self.assertIn("Actual simulated type: **QPSK**", " ".join(m.value for m in lab.markdown))
         self.assertEqual(self.link_notes(app), [])
         # Opening a link never rewrites it.
         self.assertEqual(app.query_params, {key: [value] for key, value in link.items()})
@@ -559,6 +686,18 @@ class ShareableUrlTests(AppTestCase):
         app = app.run(timeout=20)
         self.assertEqual(self.controls(app), ("noise", 6.0, 0.005, 7))
 
+        # After Back or Forward, the page reruns the app with the query string
+        # the app last wrote, not the one in the address bar, so the app cannot
+        # follow the address; the share hint says so.
+        app.query_params.clear()
+        app.query_params.update(written)
+        app = app.run(timeout=20)
+        self.assertEqual(self.controls(app), ("noise", 6.0, 0.005, 7))
+        hint = next(item.value for item in app.tabs[0].markdown if item.value.startswith(SHARE_HINT_START))
+        for words in ("Back and Forward buttons change the address but not the example",
+                      "change a control to update the address", "reload the page"):
+            self.assertIn(words, hint)
+
         # Opening the written URL in a new session shows exactly the same example.
         reopened, downloads = self.run_and_record_downloads(query_params=written)
         self.assertEqual(self.controls(reopened), ("noise", 6.0, 0.005, 7))
@@ -591,8 +730,9 @@ class UncertainAndWholeFileTests(AppTestCase):
         self.assertEqual((metric.label, metric.value), ("Demo model prediction", "BPSK"))
         text = self.markdown_text(app)
         self.assertRegex(
-            text, r"The model names BPSK: the window is \d+\.\d from the nearest trained class "
-            r"\(limit \d+\.\d\) and the top score is \d\.\d\d \(minimum 0\.60\)\."
+            text, r"The model names BPSK: the window is \d+\.\d\d+ from the nearest trained "
+            rf"class \(limit {self.demo.model.distance_threshold:.2f}\) and the top score is "
+            r"\d\.\d\d+ \(minimum 0\.60\)\."
         )
 
     def test_unfamiliar_upload_is_uncertain_and_names_the_leading_candidate(self):
@@ -602,11 +742,11 @@ class UncertainAndWholeFileTests(AppTestCase):
         self.assertEqual((metric.label, metric.value), ("Demo model prediction", "Uncertain"))
         self.assertRegex(
             self.markdown_text(app),
-            r"Uncertain because the window is unlike the training data: it is \d+\.\d from "
-            r"the nearest trained class, beyond the limit of \d+\.\d\. The leading candidate "
+            r"Uncertain because the window is unlike the training data: it is \d+\.\d\d+ from "
+            r"the nearest trained class, beyond the limit of \d+\.\d\d+\. The leading candidate "
             r"is (noise|BPSK|QPSK) with a score of \d\.\d\d\.",
         )
-        captions = " ".join(caption.value for caption in app.tabs[1].caption)
+        captions = " ".join(item.value for item in app.tabs[1].markdown)
         for claim in (
             "simple distance-and-score heuristic",
             "tested only on synthetic probe signals",
@@ -636,13 +776,12 @@ class UncertainAndWholeFileTests(AppTestCase):
             list(zip(table.value["Decision"], table.value["Windows"])), decision_counts(expected)
         )
         self.assertEqual(list(table.value["Share of windows"])[1], "66.7%")
-        captions = " ".join(caption.value for caption in upload_tab.caption)
         self.assertIn(
             "The last 10 samples, after window 3, were ignored because they do not fill a "
             f"complete {SAMPLES_PER_WINDOW:,}-sample window.",
-            captions,
+            " ".join(item.value for item in upload_tab.markdown),
         )
-        self.assertIn("Showing window 1 of 3", captions)
+        self.assertIn("Showing window 1 of 3", " ".join(item.value for item in upload_tab.caption))
 
         rows = list(csv.DictReader(StringIO(downloads[RESULTS_LABEL])))
         self.assertEqual([row["window"] for row in rows], ["1", "2", "3"])
@@ -657,7 +796,7 @@ class UncertainAndWholeFileTests(AppTestCase):
 
     def test_whole_recording_leaves_no_ignored_samples_note(self):
         app = self.run_csv(to_csv(self.known_windows()).encode())
-        captions = " ".join(caption.value for caption in app.tabs[1].caption)
+        captions = " ".join(item.value for item in app.tabs[1].markdown)
         self.assertIn("The timeline shows 2 windows: 2 BPSK.", captions)
         self.assertNotIn("were ignored", captions)
 
@@ -682,6 +821,25 @@ class UncertainAndWholeFileTests(AppTestCase):
             f"windows 3 to 4: {UNCERTAIN}", self.chart_summaries(app.tabs[1])["uploaded-timeline"]
         )
 
+    def test_hover_never_rounds_a_close_score_up_to_the_minimum(self):
+        classes = self.demo.model.classes
+        best = classes.index("QPSK")
+        scores = np.full((2, len(classes)), (1 - 0.598) / (len(classes) - 1))
+        scores[:, best] = 0.598
+        scores[1, best], scores[1, best - 1] = 0.95, scores[1, best - 1] + 0.598 - 0.95
+        crafted = FileClassification(
+            classes, np.arange(2) * SAMPLES_PER_WINDOW, (UNCERTAIN, "QPSK"),
+            (REASON_CLOSE_SCORES, ""), scores, np.array([1.0, 1.0]), 0,
+        )
+        with patch("spectrum_sense.classify_recording", return_value=crafted):
+            app = self.run_csv(to_csv(self.known_windows()).encode())
+        hovers = {
+            trace["name"]: trace["hovertext"]
+            for trace in self.chart_spec(app, "uploaded-timeline")["data"]
+        }
+        self.assertIn(f"{REASON_CLOSE_SCORES}; leading class QPSK, score 0.598)", hovers[UNCERTAIN][0])
+        self.assertIn("QPSK (leading class QPSK, score 0.95)", hovers["QPSK"][0])
+
     def test_about_tab_reports_limits_and_measured_rates(self):
         app = self.run_app()
         about = app.tabs[2]
@@ -695,16 +853,31 @@ class UncertainAndWholeFileTests(AppTestCase):
         self.assertIn(
             f"On {demo.test_windows:,} held-out windows of noise, BPSK, and QPSK, "
             f"{demo.false_reject_rate:.1%} were answered uncertain; the other windows were "
-            f"{demo.accepted_accuracy:.1%} accurate.",
+            f"{demo.accepted_accuracy:.1%} accurate. Both rates depend on SNR",
             text,
         )
-        (table,) = about.dataframe
+        # test_uncertain.py checks this claim about the Explore tab.
+        self.assertIn(
+            f"At {SNR_DB_RANGE[0]:g} dB, most BPSK examples in the Explore tab are answered "
+            "uncertain, and some of the others are wrong.",
+            text,
+        )
+        by_snr, table = about.dataframe
+        self.assertEqual(
+            list(by_snr.value["Held-out windows"]), [rates.group for rates in demo.rates_by_snr]
+        )
+        self.assertEqual(list(by_snr.value["Windows"]), [rates.windows for rates in demo.rates_by_snr])
+        self.assertEqual(sum(rates.windows for rates in demo.rates_by_snr), demo.test_windows)
+        self.assertEqual(
+            list(by_snr.value["Answered uncertain"]),
+            [f"{rates.false_reject_rate:.1%}" for rates in demo.rates_by_snr],
+        )
         self.assertEqual(list(table.value.iloc[:, 0]), list(PROBE_KINDS))
         for snr, rates in demo.probe_flag_rates.items():
             with self.subTest(snr=snr):
                 column = table.value[f"Answered uncertain at {snr:g} dB SNR"]
                 self.assertEqual(list(column), [f"{rates[kind]:.0%}" for kind in PROBE_KINDS])
-        captions = " ".join(caption.value for caption in about.caption)
+        captions = " ".join(item.value for item in about.markdown)
         self.assertIn("Neither the probes nor the held-out captures were used", captions)
         self.assertIn("not validated unknown-signal detection", captions)
 

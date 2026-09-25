@@ -1,6 +1,7 @@
 """Regression tests for import cost, the plotting CLI, and upload caching."""
 
 from io import BytesIO
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -118,16 +119,45 @@ class UploadCacheTests(unittest.TestCase):
         capture, _, _ = generate_capture("QPSK", np.random.default_rng(5), windows=3)
         app, _ = self.start_app(iq_csv.to_csv(capture.ravel()).encode())
         self.assert_no_exceptions(app)
-        self.assertIn("The timeline shows 3 windows", " ".join(c.value for c in app.caption))
+        self.assertIn("The timeline shows 3 windows", " ".join(m.value for m in app.markdown))
         shorter = BytesIO(iq_csv.to_csv(capture.ravel()[: 2 * SAMPLES_PER_WINDOW]).encode())
         shorter.name = "recording.csv"
         self.uploads[:] = [shorter]
         app = app.run(timeout=20)
         self.assert_no_exceptions(app)
-        self.assertIn("The timeline shows 2 windows", " ".join(c.value for c in app.caption))
-        self.assertIn("and 15 time steps down", " ".join(c.value for c in app.caption))
+        self.assertIn("The timeline shows 2 windows", " ".join(m.value for m in app.markdown))
+        self.assertIn("and 15 time steps down", " ".join(m.value for m in app.markdown))
         self.assertEqual(self.classifier.call_count, 2)
         self.assertEqual(self.spectrogram.call_count, 2)
+
+    def test_each_run_hashes_the_upload_once(self):
+        # Streamlit hashes every argument not named with a leading underscore on
+        # every call, copying the uploaded bytes each time. Only one cached
+        # function may take a hashed argument, so a run hashes the upload once.
+        real_cache_data = st.cache_data
+        hashed = {}
+
+        def recording_cache_data(func=None, **options):
+            def decorate(function):
+                parameters = inspect.signature(function).parameters
+                hashed[function.__name__] = [name for name in parameters if not name.startswith("_")]
+                return real_cache_data(function, **options)
+
+            return decorate if func is None else decorate(func)
+
+        capture, _, _ = generate_capture("QPSK", np.random.default_rng(5), windows=2)
+        with patch("streamlit.cache_data", new=recording_cache_data):
+            app, parser = self.start_app(iq_csv.to_csv(capture.ravel()).encode())
+            self.assert_no_exceptions(app)
+            slider = next(item for item in app.slider if item.label == "Window to inspect")
+            app = slider.set_value(2).run(timeout=20)
+        self.assert_no_exceptions(app)
+        self.assertIn("example_csv", hashed)
+        self.assertEqual(
+            {name: arguments for name, arguments in hashed.items() if arguments},
+            {"analyze_upload": ["files"]},
+        )
+        self.assertEqual(parser.call_count, 1)
 
     def test_invalid_upload_error_is_not_cached(self):
         payload = b"I,Q\nwrong,2\n" + b"1,2\n" * SAMPLES_PER_WINDOW

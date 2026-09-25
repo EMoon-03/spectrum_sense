@@ -17,10 +17,12 @@ from signal_config import (
 from spectrogram import FLOOR_DB, SEGMENT_LENGTH, Spectrogram, compute_spectrogram
 from spectrum_sense import Decision, decision_order, generate_capture
 from summaries import (
+    CLEAR_PEAK_DB,
     MAX_LISTED_RUNS,
     STEADY_LEVEL_DB,
     constellation_summary,
     decision_summary,
+    format_against_limit,
     format_duration,
     format_frequency,
     format_sample_rate,
@@ -44,6 +46,18 @@ def tone(bin_index: int, n: int = SAMPLES_PER_WINDOW) -> np.ndarray:
 def tone_at(cycles: float, n: int) -> np.ndarray:
     """A unit tone at a frequency in cycles per sample."""
     return np.exp(2j * np.pi * cycles * np.arange(n))
+
+
+def sweep(start: float, stop: float, n: int) -> np.ndarray:
+    """A unit tone whose frequency rises linearly from start to stop cycles per sample."""
+    frequency = start + (stop - start) * np.arange(n) / n
+    return np.exp(2j * np.pi * np.cumsum(frequency))
+
+
+def hops(frequencies, dwell: int, n: int) -> np.ndarray:
+    """A unit tone that cycles through the frequencies, dwell samples on each."""
+    choice = np.asarray(frequencies)[(np.arange(n) // dwell) % len(frequencies)]
+    return np.exp(2j * np.pi * np.cumsum(choice))
 
 
 def tone_over_flat_floor(bin_index: int, n: int = SAMPLES_PER_WINDOW) -> np.ndarray:
@@ -101,17 +115,56 @@ class DecisionSummaryTests(unittest.TestCase):
     def test_named_class(self):
         self.assertEqual(
             decision_summary(Decision("BPSK", None, "BPSK", 0.987, 2.34), 4.43, 0.6),
-            "The model names BPSK: the window is 2.3 from the nearest trained class "
-            "(limit 4.4) and the top score is 0.99 (minimum 0.60).",
+            "The model names BPSK: the window is 2.34 from the nearest trained class "
+            "(limit 4.43) and the top score is 0.99 (minimum 0.60).",
         )
 
     def test_unlike_the_training_data(self):
         decision = Decision(UNCERTAIN, REASON_UNFAMILIAR, "QPSK", 0.996, 12.06)
         self.assertEqual(
             decision_summary(decision, 4.43, 0.6),
-            "Uncertain because the window is unlike the training data: it is 12.1 from the "
-            "nearest trained class, beyond the limit of 4.4. The leading candidate is QPSK "
+            "Uncertain because the window is unlike the training data: it is 12.06 from the "
+            "nearest trained class, beyond the limit of 4.43. The leading candidate is QPSK "
             "with a score of 1.00.",
+        )
+
+    def test_limits_have_the_same_places_as_the_about_tab(self):
+        # The demo model's limit is about 4.4298; the About tab prints it as 4.43.
+        decision = Decision(UNCERTAIN, REASON_UNFAMILIAR, "BPSK", 0.99, 4.44)
+        self.assertIn(
+            "it is 4.44 from the nearest trained class, beyond the limit of 4.43.",
+            decision_summary(decision, 4.4298, 0.6),
+        )
+
+    def test_a_value_just_past_a_limit_never_prints_equal_to_it(self):
+        for decision, expected in (
+            (
+                Decision(UNCERTAIN, REASON_CLOSE_SCORES, "noise", 0.598, 1.0),
+                "the top score is 0.598, below the minimum of 0.600. The leading "
+                "candidate is noise with a score of 0.598.",
+            ),
+            (
+                Decision(UNCERTAIN, REASON_CLOSE_SCORES, "BPSK", 0.59999, 1.0),
+                "the top score is 0.59999, below the minimum of 0.60000.",
+            ),
+            (
+                Decision(UNCERTAIN, REASON_UNFAMILIAR, "BPSK", 0.99, 4.4301),
+                "it is 4.4301 from the nearest trained class, beyond the limit of 4.4298.",
+            ),
+            (
+                Decision("QPSK", None, "QPSK", 0.6004, 4.4295),
+                "the window is 4.429 from the nearest trained class (limit 4.430) and the "
+                "top score is 0.6004 (minimum 0.6000).",
+            ),
+        ):
+            with self.subTest(decision=decision):
+                self.assertIn(expected, decision_summary(decision, 4.4298, 0.6))
+
+    def test_values_equal_to_a_limit_print_equal(self):
+        self.assertIn(
+            "the window is 4.43 from the nearest trained class (limit 4.43) and the top "
+            "score is 0.60 (minimum 0.60).",
+            decision_summary(Decision("BPSK", None, "BPSK", 0.6, 4.4298), 4.4298, 0.6),
         )
 
     def test_scores_are_close(self):
@@ -121,6 +174,32 @@ class DecisionSummaryTests(unittest.TestCase):
             "Uncertain because the scores are close: the top score is 0.52, below the "
             "minimum of 0.60. The leading candidate is noise with a score of 0.52.",
         )
+
+
+class FormatAgainstLimitTests(unittest.TestCase):
+    def test_extra_places_only_when_needed(self):
+        for value, limit, expected in (
+            (0.52, 0.6, ("0.52", "0.60")),
+            (0.597, 0.6, ("0.597", "0.600")),
+            (0.6, 0.6, ("0.60", "0.60")),
+            (4.44, 4.4298, ("4.44", "4.43")),
+            (4.4301, 4.4298, ("4.4301", "4.4298")),
+            (12.06, 4.43, ("12.06", "4.43")),
+        ):
+            with self.subTest(value=value, limit=limit):
+                self.assertEqual(format_against_limit(value, limit), expected)
+        self.assertEqual(format_against_limit(0.5987, 0.6, 1), ("0.599", "0.600"))
+
+    def test_the_printed_order_matches_the_true_order(self):
+        rng = np.random.default_rng(4)
+        limits = rng.uniform(0, 10, 200)
+        for limit in limits:
+            for gap in (1e-9, 1e-6, 4e-3, 0.02):
+                for value in (limit - gap, limit + gap):
+                    shown, bound = format_against_limit(value, limit)
+                    with self.subTest(value=value, limit=limit):
+                        self.assertNotEqual(shown, bound)
+                        self.assertEqual(float(shown) > float(bound), value > limit)
 
 
 class TimelineSummaryTests(unittest.TestCase):
@@ -319,8 +398,10 @@ class SpectrogramSummaryTests(SummaryTestCase):
             "The spectrogram shows 8 frequency bins across and 3 time steps down; each "
             "averages 3 overlapping 8-sample segments (the last averages 1). Averaged over "
             "time, the strongest frequency is 0.125 cycles per sample, 20.0 dB above the "
-            "median bin. The overall level changes over time: the quietest time step, around "
-            "sample 8, is 6.1 dB below the loudest, around sample 28.",
+            "median bin. The strongest frequency of each time step changes abruptly once, "
+            "from 0.125 cycles per sample to -0.375 cycles per sample. The overall level "
+            "changes over time: the quietest time step, around sample 8, is 6.1 dB below "
+            "the loudest, around sample 28.",
         )
 
     def test_sample_rate_gives_hertz_and_times_and_center_gives_radio_frequency(self):
@@ -346,9 +427,77 @@ class SpectrogramSummaryTests(SummaryTestCase):
             "The spectrogram shows 256 frequency bins across and 31 time steps down; each is "
             "one 256-sample segment, overlapping the next by half. Averaged over time, the "
             "strongest frequency is 0.125 cycles per sample, at least 80 dB above the median "
-            "bin. The overall level is steady over time: every time step is within 0.0 dB of "
+            "bin. The strongest frequency of each time step stays at 0.125 cycles per sample. "
+            "The overall level is steady over time: every time step is within 0.0 dB of "
             "the loudest.",
         )
+
+    def test_a_sweep_moves_gradually(self):
+        # A sighted reader sees one diagonal line; averaged over time it is flat.
+        text = self.summarize(compute_spectrogram(sweep(-0.4, 0.4, 20 * SAMPLES_PER_WINDOW)))
+        self.assertIn("Averaged over time, the spectrum is flat", text)
+        self.assertIn(
+            "The strongest frequency of each time step moves gradually: it is -0.266 cycles "
+            "per sample near the start, 0.000 cycles per sample in the middle, and 0.266 "
+            "cycles per sample near the end.",
+            text,
+        )
+        falling = self.summarize(compute_spectrogram(sweep(0.3, -0.3, 8 * SAMPLES_PER_WINDOW)))
+        self.assertRegex(
+            falling, r"moves gradually: it is 0\.\d+ cycles per sample near the start, .* "
+            r"and -0\.\d+ cycles per sample near the end\."
+        )
+
+    def test_a_hopping_tone_switches(self):
+        samples = hops([0.2, -0.2], 2048, 20 * SAMPLES_PER_WINDOW)
+        self.assertIn(
+            "The strongest frequency of each time step switches abruptly 9 times between "
+            "0.199 cycles per sample and -0.199 cycles per sample.",
+            self.summarize(compute_spectrogram(samples)),
+        )
+        self.assertIn(
+            "switches abruptly 9 times between 0.199 cycles per sample (478 kHz above the "
+            "center of the recorded band) and -0.199 cycles per sample (478 kHz below the "
+            "center of the recorded band).",
+            self.summarize(compute_spectrogram(samples), 2.4e6, 433.92e6),
+        )
+        once = np.concatenate([tone_at(0.2, 8192), tone_at(-0.1, 8192)])
+        self.assertIn(
+            "changes abruptly once, from 0.199 cycles per sample to -0.102 cycles per sample.",
+            self.summarize(compute_spectrogram(once)),
+        )
+        several = hops([0.3, -0.1, 0.1, -0.35], 4096, 16384)
+        self.assertIn(
+            "changes abruptly 3 times: it is 0.301 cycles per sample near the start",
+            self.summarize(compute_spectrogram(several)),
+        )
+
+    def test_modulated_signals_stay_near_their_carrier(self):
+        # BPSK and QPSK spread over about a quarter of the band, and their
+        # strongest bin wanders within it; that is not a moving frequency.
+        for label in ("BPSK", "QPSK"):
+            for snr, offset in ((-2, 0.0), (6, 0.005), (20, -0.008)):
+                with self.subTest(label=label, snr=snr, offset=offset):
+                    capture, _, _ = generate_capture(
+                        label, np.random.default_rng(3), 20,
+                        snr_db_override=snr, freq_offset_override=offset,
+                    )
+                    text = self.summarize(compute_spectrogram(capture.ravel()))
+                    self.assertRegex(
+                        text, r"[Tt]he strongest frequency (of each time step )?stays near -?0\.0"
+                    )
+                    self.assertNotIn("abruptly", text)
+
+    def test_noise_has_no_clear_strongest_frequency(self):
+        rng = np.random.default_rng(1)
+        for n in (SAMPLES_PER_WINDOW, 20 * SAMPLES_PER_WINDOW, 100_000):
+            with self.subTest(n=n):
+                noise = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+                text = self.summarize(compute_spectrogram(noise))
+                self.assertRegex(
+                    text, "(No time step has a|Most time steps have no) clear strongest frequency"
+                )
+                self.assertIn(f"at least {CLEAR_PEAK_DB:g} dB above the step's median bin", text)
 
     def test_known_level_changes_are_located(self):
         samples = tone_at(0.125, 4096)
@@ -385,9 +534,10 @@ class SpectrogramSummaryTests(SummaryTestCase):
             self.summarize(compute_spectrogram(samples)),
             "The spectrogram shows 256 frequency bins across and 7 time steps down; each is "
             "one 256-sample segment, overlapping the next by half. Averaged over time, the "
-            "spectrum is flat; no bin is more than 0.1 dB above the median bin. The overall "
-            "level changes over time: the quietest time step, around sample 256, is at least "
-            "80 dB below the loudest, around sample 128.",
+            "spectrum is flat; no bin is more than 0.1 dB above the median bin. No time step "
+            "has a clear strongest frequency (a bin at least 12 dB above the step's median "
+            "bin). The overall level changes over time: the quietest time step, around "
+            "sample 256, is at least 80 dB below the loudest, around sample 128.",
         )
 
     def test_all_zero_recording(self):

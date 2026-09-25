@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 import plotly.graph_objects as go
@@ -19,13 +20,20 @@ from explore_url import (
     parse_explore_params,
 )
 from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, to_csv
-from iq_formats import MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, Recording, load_uploads
+from iq_formats import (
+    MAX_FILE_BYTES,
+    SUPPORTED_EXTENSIONS,
+    Recording,
+    load_uploads,
+    select_uploads,
+)
 from signal_config import (
     CLASSES,
     DISTANCE_PERCENTILE,
     FREQ_OFFSET_RANGE,
     NOT_CLASSIFIABLE,
     PROBE_KINDS,
+    REASON_CLOSE_SCORES,
     SAMPLES_PER_SYMBOL,
     SAMPLES_PER_WINDOW,
     SNR_DB_RANGE,
@@ -48,6 +56,7 @@ from spectrum_sense import (
 from summaries import (
     constellation_summary,
     decision_summary,
+    format_against_limit,
     format_frequency,
     format_sample_rate,
     scores_summary,
@@ -101,6 +110,16 @@ CONTROL_KEYS = {
 # The settings that the URL describes, and notes about a link's unusable values.
 URL_SETTINGS = "explore_url_settings"
 URL_NOTES = "explore_url_notes"
+# After Back or Forward, Streamlit reruns the app with the query string that the
+# app last wrote, not the one in the address bar, so the app cannot see the change.
+SHARE_HINT = (
+    "**To share this exact example,** copy the address from your browser's address bar. "
+    "The Back and Forward buttons change the address but not the example, so after "
+    "using them, change a control to update the address, or reload the page to show "
+    "the example in the address."
+)
+# Every ASCII punctuation character; Markdown shows one as is after a backslash.
+MARKDOWN_PUNCTUATION = re.compile(r"([!-/:-@\[-`{-~])")
 
 
 @st.cache_resource(show_spinner="Training the synthetic baseline…")
@@ -110,33 +129,35 @@ def get_demo_model() -> DemoModel:
     return build_demo_model()
 
 
-@st.cache_data(max_entries=2, show_spinner=False, scope="session")
-def parse_upload(files: tuple[tuple[str, bytes], ...]) -> Recording:
-    """Parse (name, data) uploads once per session, not on every widget change.
+@st.cache_data(
+    max_entries=2, show_spinner="Reading and classifying the recording…", scope="session"
+)
+def analyze_upload(
+    files: tuple[tuple[str, bytes], ...], _model: SignalClassifier
+) -> tuple[Recording, FileClassification, Spectrogram]:
+    """Read (name, data) uploads, decide every window, and compute the
+    spectrogram once per session, not on every widget change.
 
-    Streamlit does not cache raised errors, so an invalid file is rechecked and
-    its ValueError reaches the caller on every run.
+    The uploads are the only hashed argument, so each run hashes them once; the
+    model never changes in a process. Streamlit does not cache raised errors,
+    so an invalid file is rechecked and its ValueError reaches the caller on
+    every run.
     """
-    return load_uploads(files)
+    recording = load_uploads(files)
+    return (
+        recording,
+        classify_recording(_model, recording.samples),
+        compute_spectrogram(recording.samples),
+    )
 
 
-@st.cache_data(max_entries=2, show_spinner="Classifying every window…", scope="session")
-def classify_upload(
-    files: tuple[tuple[str, bytes], ...], _samples: np.ndarray, _model: SignalClassifier
-) -> FileClassification:
-    """Decide every window once per upload, not on every widget change.
-
-    The cache key is the uploaded (name, data) pairs. The samples are parsed
-    from them and the model never changes in a process, so neither is hashed.
-    """
-    return classify_recording(_model, _samples)
-
-
-@st.cache_data(max_entries=2, show_spinner=False, scope="session")
-def upload_spectrogram(files: tuple[tuple[str, bytes], ...], _samples: np.ndarray) -> Spectrogram:
-    """Compute the whole-file spectrogram once per upload; like classify_upload,
-    the cache key is the uploaded (name, data) pairs."""
-    return compute_spectrogram(_samples)
+def as_plain_markdown(text: str) -> str:
+    """Markdown that shows text as it is: characters that cannot be sent to the
+    browser (lone surrogates) become escape codes, and every punctuation
+    character that Markdown or Streamlit could read as a link, formatting, or
+    an icon is escaped. Error messages go through this before st.error."""
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return MARKDOWN_PUNCTUATION.sub(r"\\\1", text)
 
 
 @st.cache_data(show_spinner=False)
@@ -179,7 +200,11 @@ def signal_plots(
     center_frequency: float | None = None,
 ) -> None:
     """Hoverable, zoomable time, constellation, and frequency views, each with a
-    text summary directly underneath. I and Q differ in line style, not only color."""
+    text summary directly underneath. I and Q differ in line style, not only color.
+
+    Summaries are body text, not captions: Streamlit fades captions to a contrast
+    of 3.7:1 on its light theme, below the 4.5:1 that WCAG asks of text.
+    """
     shown = samples[:TIME_VIEW_SAMPLES]
     time_axis = np.arange(len(shown))
     time_plot = go.Figure()
@@ -219,14 +244,14 @@ def signal_plots(
     )
 
     st.plotly_chart(time_plot, key=f"{section}-time")
-    st.caption(time_summary(samples, TIME_VIEW_SAMPLES))
+    st.markdown(time_summary(samples, TIME_VIEW_SAMPLES))
     left, right = st.columns(2)
     with left:
         st.plotly_chart(constellation, key=f"{section}-constellation")
-        st.caption(constellation_summary(samples, CONSTELLATION_STEP))
+        st.markdown(constellation_summary(samples, CONSTELLATION_STEP))
     with right:
         st.plotly_chart(fft_plot, key=f"{section}-fft")
-        st.caption(spectrum_summary(samples, sample_rate, center_frequency))
+        st.markdown(spectrum_summary(samples, sample_rate, center_frequency))
 
 
 def show_prediction(model: SignalClassifier, samples: np.ndarray, section: str) -> None:
@@ -236,7 +261,7 @@ def show_prediction(model: SignalClassifier, samples: np.ndarray, section: str) 
     shown = "Uncertain" if decision.label == UNCERTAIN else decision.label
     st.metric("Demo model prediction", shown)
     st.write(decision_summary(decision, model.distance_threshold, model.min_top_score))
-    st.caption(UNCERTAIN_NOTE)
+    st.markdown(UNCERTAIN_NOTE)
     score_plot = go.Figure(
         go.Bar(
             x=model.classes, y=scores, marker_color=BLUE,
@@ -251,20 +276,24 @@ def show_prediction(model: SignalClassifier, samples: np.ndarray, section: str) 
         height=280,
     )
     st.plotly_chart(score_plot, key=f"{section}-scores")
-    st.caption(
+    st.markdown(
         f"{scores_summary(model.classes, scores)} Scores are model outputs, not calibrated "
         "confidence or proof that an unknown signal belongs to a class."
     )
 
 
-def window_hover(result: FileClassification, index: int) -> str:
+def window_hover(result: FileClassification, index: int, min_top_score: float) -> str:
     start = int(result.starts[index])
     where = f"Window {index + 1:,}: samples {start:,} to {start + SAMPLES_PER_WINDOW - 1:,}"
     label = result.labels[index]
     if label == NOT_CLASSIFIABLE:
         return f"{where}<br>{label}: {result.reasons[index]}"
     best = int(np.argmax(result.scores[index]))
-    detail = f"leading class {result.classes[best]}, score {result.scores[index, best]:.2f}"
+    score = float(result.scores[index, best])
+    shown = f"{score:.2f}"
+    if result.reasons[index] == REASON_CLOSE_SCORES:
+        shown, _ = format_against_limit(score, min_top_score)  # Never "0.60" when below 0.60.
+    detail = f"leading class {result.classes[best]}, score {shown}"
     if label == UNCERTAIN:
         detail = f"{result.reasons[index]}; {detail}"
     return f"{where}<br>{label} ({detail})"
@@ -304,10 +333,10 @@ def show_spectrogram(
         "a frequency. Lighter cells hold more power; hover over a cell to read its level."
     )
     st.plotly_chart(heatmap, key="uploaded-spectrogram")
-    st.caption(spectrogram_summary(spectrogram, sample_rate, center_frequency))
+    st.markdown(spectrogram_summary(spectrogram, sample_rate, center_frequency))
 
 
-def show_file_results(result: FileClassification) -> None:
+def show_file_results(result: FileClassification, min_top_score: float) -> None:
     """A timeline of the decision for every window with its text summary, a
     count table, a note on ignored trailing samples, and a CSV download."""
     order = decision_order(result.classes)
@@ -323,7 +352,8 @@ def show_file_results(result: FileClassification) -> None:
                         symbol=MARKER_SYMBOLS.get(name, "circle"), size=10,
                         color=MARKER_COLORS.get(name, BLUE),
                     ),
-                    hovertext=[window_hover(result, index) for index in rows], hoverinfo="text",
+                    hovertext=[window_hover(result, index, min_top_score) for index in rows],
+                    hoverinfo="text",
                 )
             )
     timeline.update_layout(
@@ -334,7 +364,7 @@ def show_file_results(result: FileClassification) -> None:
         ),
     )
     st.plotly_chart(timeline, key="uploaded-timeline")
-    st.caption(timeline_summary(result.labels, order))
+    st.markdown(timeline_summary(result.labels, order))
 
     counts = decision_counts(result)
     total = len(result.labels)
@@ -347,7 +377,7 @@ def show_file_results(result: FileClassification) -> None:
         hide_index=True,
     )
     if result.ignored_samples:
-        st.caption(
+        st.markdown(
             f"The last {result.ignored_samples:,} samples, after window {total:,}, were "
             f"ignored because they do not fill a complete {SAMPLES_PER_WINDOW:,}-sample window."
         )
@@ -399,7 +429,6 @@ with lab_tab:
             key=CONTROL_KEYS["seed"],
             help="The same seed always gives the same recording; change it for new random bits and noise.",
         )
-        st.caption("To share this exact example, copy the address from your browser's address bar.")
     settings = explore_settings(label, snr, offset, seed)
     save_settings_to_url(settings)
     with explanation:
@@ -410,6 +439,7 @@ with lab_tab:
             "- **Carrier offset:** shifts and rotates the received signal.\n"
             "- **Example seed:** change it to generate another random message and noise pattern."
         )
+        st.markdown(SHARE_HINT)
         if st.session_state[URL_NOTES]:
             st.info(
                 "Part of this link could not be used as given:\n\n"
@@ -428,7 +458,7 @@ with lab_tab:
         snr_db_override=settings.snr_db, freq_offset_override=settings.offset,
     )
     selected_samples = recording[0]
-    st.caption(
+    st.markdown(
         f"Actual simulated type: **{settings.signal}** · {len(selected_samples)} I/Q samples"
     )
     show_prediction(model, selected_samples, "lab")
@@ -486,13 +516,21 @@ with upload_tab:
         ),
     )
     if uploads:
-        files = tuple((upload.name, upload.getvalue()) for upload in uploads)
+        # The uploader adds each new choice to its list, so read the latest one.
+        chosen, ignored = select_uploads([(upload.name, upload) for upload in uploads])
+        files = tuple((name, upload.getvalue()) for name, upload in chosen)
+        if ignored:
+            st.info(
+                f"Only the most recently added recording is read, so {ignored:,} earlier "
+                f"file{' was' if ignored == 1 else 's were'} ignored. You can remove files "
+                "you no longer need from the list above."
+            )
         try:
-            loaded = parse_upload(files)
+            loaded, file_result, spectrogram = analyze_upload(files, model)
         except ValueError as exc:
             st.error(
-                f"{exc}\n\nTip: the example from **Download an example CSV** above always "
-                "loads, so you can compare your file with it."
+                f"{as_plain_markdown(str(exc))}\n\nTip: the example from **Download an "
+                "example CSV** above always loads, so you can compare your file with it."
             )
         else:
             values = loaded.samples
@@ -511,12 +549,10 @@ with upload_tab:
                 "real-world radio traffic."
             )
             st.subheader("Every window")
-            show_file_results(classify_upload(files, values, model))
+            show_file_results(file_result, model.min_top_score)
 
             st.subheader("Frequency content over time")
-            show_spectrogram(
-                upload_spectrogram(files, values), loaded.sample_rate, loaded.center_frequency
-            )
+            show_spectrogram(spectrogram, loaded.sample_rate, loaded.center_frequency)
 
             st.subheader("One window in detail")
             available = len(values) // SAMPLES_PER_WINDOW
@@ -536,7 +572,7 @@ with upload_tab:
             try:
                 show_prediction(model, window, "uploaded")
             except ValueError as exc:
-                st.error(str(exc))
+                st.error(as_plain_markdown(str(exc)))
             signal_plots(window, "uploaded", loaded.sample_rate, loaded.center_frequency)
 
 with about_tab:
@@ -579,7 +615,25 @@ with about_tab:
     st.write(
         f"On {demo.test_windows:,} held-out windows of noise, BPSK, and QPSK, "
         f"{demo.false_reject_rate:.1%} were answered uncertain; the other windows were "
-        f"{demo.accepted_accuracy:.1%} accurate."
+        f"{demo.accepted_accuracy:.1%} accurate. Both rates depend on SNR: uncertain "
+        "answers and errors are most common near the bottom of the training range. At "
+        f"{SNR_DB_RANGE[0]:g} dB, most BPSK examples in the Explore tab are answered "
+        "uncertain, and some of the others are wrong."
+    )
+    st.dataframe(
+        {
+            "Held-out windows": [rates.group for rates in demo.rates_by_snr],
+            "Windows": [rates.windows for rates in demo.rates_by_snr],
+            "Answered uncertain": [
+                f"{rates.false_reject_rate:.1%}" for rates in demo.rates_by_snr
+            ],
+            "Accuracy of the other windows": [
+                "none answered" if math.isnan(rates.accepted_accuracy)
+                else f"{rates.accepted_accuracy:.1%}"
+                for rates in demo.rates_by_snr
+            ],
+        },
+        hide_index=True,
     )
     snrs = sorted(demo.probe_flag_rates)
     st.dataframe(
@@ -594,7 +648,7 @@ with about_tab:
         },
         hide_index=True,
     )
-    st.caption(
+    st.markdown(
         f"Each rate uses {demo.probe_windows} simulated windows per probe type and SNR "
         "from a fixed seed. Neither the probes nor the held-out captures were used to "
         f"choose the limits. {UNCERTAIN_NOTE}"

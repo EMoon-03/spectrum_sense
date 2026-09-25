@@ -385,6 +385,41 @@ def probe_flag_rates(
     return rates
 
 
+@dataclass(frozen=True)
+class GroupRates:
+    """How the held-out windows of one group were answered."""
+
+    group: str  # an SNR band of BPSK and QPSK windows, or noise, which has no SNR
+    windows: int
+    false_reject_rate: float  # answered "uncertain"
+    accepted_accuracy: float  # of the other windows; NaN if every window was uncertain
+
+
+def rates_by_snr(
+    decisions: Sequence[Decision], truth: Sequence[str], snrs: Sequence[float], bands: int = 4
+) -> tuple[GroupRates, ...]:
+    """uncertain_rates for signal windows in equal SNR bands across SNR_DB_RANGE,
+    then for noise windows, whose SNR is NaN. Empty groups are left out."""
+    snrs, truth = np.asarray(snrs, dtype=float), np.asarray(truth)
+    if not len(decisions) == len(truth) == len(snrs):
+        raise ValueError("Provide one true label and one SNR for each decision.")
+    edges = np.linspace(*SNR_DB_RANGE, bands + 1)
+    signals = " and ".join(name for name in CLASSES if name != "noise")
+    masks = [
+        (f"{signals} at {lower:g} to {upper:g} dB SNR", (snrs >= lower) & (snrs < upper))
+        for lower, upper in zip(edges[:-1], edges[1:])
+    ]
+    masks[-1] = (masks[-1][0], (snrs >= edges[-2]) & (snrs <= edges[-1]))
+    masks.append(("Noise (no SNR)", np.isnan(snrs)))
+    rates = []
+    for group, mask in masks:
+        if mask.any():
+            chosen = [item for item, keep in zip(decisions, mask) if keep]
+            rejected, accuracy = uncertain_rates(chosen, truth[mask])
+            rates.append(GroupRates(group, int(mask.sum()), rejected, accuracy))
+    return tuple(rates)
+
+
 @dataclass(frozen=True, eq=False)
 class DemoModel:
     """The app's model and the measurements shown with it."""
@@ -397,6 +432,7 @@ class DemoModel:
     test_accuracy: float  # always taking the top class
     false_reject_rate: float  # held-out known windows answered "uncertain"
     accepted_accuracy: float  # accuracy on the other held-out windows
+    rates_by_snr: tuple[GroupRates, ...]  # the same two rates for groups of held-out windows
     probe_windows: int  # per probe type and SNR
     probe_flag_rates: dict[float, dict[str, float]]  # by SNR in dB, then probe type
 
@@ -415,7 +451,7 @@ def build_demo_model(
     Held-out captures and probes are for reporting only; no setting is tuned on them.
     """
     rng = np.random.default_rng(seed)
-    all_windows, labels, groups, _, _ = make_dataset(rng, captures_per_class, windows)
+    all_windows, labels, groups, snrs, _ = make_dataset(rng, captures_per_class, windows)
     train_idx, test_idx = next(
         GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed).split(
             all_windows, labels, groups
@@ -445,6 +481,7 @@ def build_demo_model(
         test_accuracy=float(np.mean(top_class == labels[test_idx])),
         false_reject_rate=false_rejects,
         accepted_accuracy=accepted_accuracy,
+        rates_by_snr=rates_by_snr(decisions, labels[test_idx], snrs[test_idx]),
         probe_windows=probe_captures * windows,
         probe_flag_rates=probe_rates,
     )

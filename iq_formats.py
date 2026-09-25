@@ -1,7 +1,9 @@
 """Load one I/Q recording from CSV, raw SDR samples, NumPy, or SigMF files.
 
 Only NumPy and the standard library are used, so this module stays light.
-Every problem with a file is reported as a plain-language ValueError.
+Every problem with a file is reported as a plain-language ValueError. A shared
+file is untrusted input, so messages never repeat free text from it, such as
+names inside an archive or metadata values; the app shows them as Markdown.
 """
 
 from __future__ import annotations
@@ -12,13 +14,18 @@ import io
 import json
 import math
 from pathlib import PurePosixPath, PureWindowsPath
+import re
 import tarfile
+from typing import TypeVar
 
 import numpy as np
 from numpy.lib import format as npy_format
 
 from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, from_csv
 from signal_config import SAMPLES_PER_WINDOW
+
+
+Upload = TypeVar("Upload")  # Anything that stands for one uploaded file.
 
 
 @dataclass(frozen=True, eq=False)
@@ -63,6 +70,11 @@ _RAW_TYPES = {
 _SIGMF_TYPES = {"cf32_le": _CF32, "ci16_le": _CS16, "ci8": _CS8, "cu8": _CU8}
 
 SUPPORTED_EXTENSIONS = ("csv", *_RAW_TYPES, "npy", "sigmf", "sigmf-meta", "sigmf-data")
+_SIGMF_PAIR = {"sigmf-meta": "sigmf-data", "sigmf-data": "sigmf-meta"}
+# Text from a file is repeated in a message only when it has one of these
+# forms, which hold nothing that Markdown could turn into links or formatting.
+_SIGMF_DATATYPE = re.compile(r"[rc](?:f64|f32|i32|i16|u32|u16|i8|u8)(?:_le|_be)?")
+_PLAIN_EXTENSION = re.compile(r"[a-z0-9]{1,16}")
 
 # np.save writes a header of about 128 bytes; NumPy refuses headers over 10,000.
 _NPY_HEADER_BYTES = 16_384
@@ -142,13 +154,15 @@ def _read_npy(data: bytes) -> Recording:
             "This .npy file stores Python objects, which are never loaded for safety. "
             "Save a plain numeric array instead."
         )
+    # Field names of a structured array come from the file, so only its kind is named.
+    shown = "structured" if dtype.fields is not None else str(dtype)
     complex_column = len(shape) == 1 and dtype.kind == "c" and dtype.itemsize <= 16
     real_pairs = (
         len(shape) == 2 and shape[1] == 2 and dtype.kind in "iuf" and dtype.itemsize <= 8
     )
     if not (complex_column or real_pairs):
         raise ValueError(
-            f"This .npy file holds a {dtype} array with shape {shape}. Save a "
+            f"This .npy file holds a {shown} array with shape {shape}. Save a "
             "one-dimensional complex64 or complex128 array, or a real array with "
             "two columns (I and Q)."
         )
@@ -208,9 +222,11 @@ def _parse_sigmf_meta(meta: bytes) -> tuple[str, _SampleType, float | None, floa
         raise ValueError('The SigMF metadata does not state its "core:datatype".')
     kind = _SIGMF_TYPES.get(datatype)
     if kind is None:
+        supported = f"Use complex samples in one of these datatypes: {', '.join(_SIGMF_TYPES)}."
+        if _SIGMF_DATATYPE.fullmatch(datatype):
+            raise ValueError(f'The SigMF datatype "{datatype}" is not supported. {supported}')
         raise ValueError(
-            f'The SigMF datatype "{datatype[:40]}" is not supported. Use complex '
-            f"samples in one of these datatypes: {', '.join(_SIGMF_TYPES)}."
+            f'The SigMF metadata\'s "core:datatype" is not a valid SigMF datatype. {supported}'
         )
     channels = section.get("core:num_channels", 1)
     if isinstance(channels, bool) or channels != 1:
@@ -240,20 +256,33 @@ def _is_unsafe_path(name: str) -> bool:
     return name.startswith(("/", "\\")) or bool(PureWindowsPath(name).drive) or ".." in parts
 
 
+def _is_macos_metadata(name: str) -> bool:
+    """An AppleDouble "._" file or a __MACOSX folder entry, which macOS adds to
+    archives to keep Finder information; neither holds samples."""
+    parts = PurePosixPath(name).parts
+    return bool(parts) and (parts[-1].startswith("._") or parts[0] == "__MACOSX")
+
+
 def _sigmf_members(members: list[tarfile.TarInfo]) -> tuple[tarfile.TarInfo, tarfile.TarInfo]:
-    """The archive's metadata and data members, after checking every entry."""
+    """The archive's metadata and data members, after checking every entry.
+
+    Member names come from the file, so messages describe entries without
+    repeating their names.
+    """
     metas: list[tarfile.TarInfo] = []
     datas: list[tarfile.TarInfo] = []
     for member in members:
-        shown = member.name[:80]
         if _is_unsafe_path(member.name):
-            raise ValueError(f'The SigMF archive contains an unsafe path, "{shown}".')
+            raise ValueError(
+                'The SigMF archive contains an unsafe path: an absolute path or one with "..".'
+            )
         if member.isdir():
             continue  # Directories hold no data; nothing is ever extracted to disk.
+        if member.isreg() and _is_macos_metadata(member.name):
+            continue
         if not member.isreg():
             raise ValueError(
-                f'The SigMF archive contains "{shown}", which is a link or special '
-                "file. Only regular files are read."
+                "The SigMF archive contains a link or special file. Only regular files are read."
             )
         if member.name.lower().endswith(".sigmf-meta"):
             metas.append(member)
@@ -276,11 +305,17 @@ def _sigmf_members(members: list[tarfile.TarInfo]) -> tuple[tarfile.TarInfo, tar
     return meta, data
 
 
+_DAMAGED_ARCHIVE = "The SigMF archive is truncated or damaged."
+
+
 def _read_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
-    stream = archive.extractfile(member)
-    content = b"" if stream is None else stream.read()
+    try:
+        stream = archive.extractfile(member)
+        content = b"" if stream is None else stream.read()
+    except Exception as exc:  # tarfile's own errors describe the file's contents.
+        raise ValueError(_DAMAGED_ARCHIVE) from exc
     if len(content) != member.size:
-        raise ValueError("The SigMF archive is truncated or damaged.")
+        raise ValueError(_DAMAGED_ARCHIVE)
     return content
 
 
@@ -292,30 +327,33 @@ def _read_sigmf_archive(data: bytes) -> Recording:
         )
     try:
         # Mode "r:" reads uncompressed tar only, entirely from memory.
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
-            members = archive.getmembers()
-            # tarfile stops quietly at a cut-off header, so only end-of-archive
-            # zero padding may follow the last member it read.
-            if archive.offset > len(data) or data[archive.offset :].strip(b"\0"):
-                raise ValueError("The SigMF archive is truncated or damaged.")
-            meta_member, data_member = _sigmf_members(members)
-            # Check each size before reading the member into memory.
-            if meta_member.size > SIGMF_META_MAX_BYTES:
-                raise ValueError(
-                    "The SigMF metadata exceeds the "
-                    f"{format_size(SIGMF_META_MAX_BYTES)} limit."
-                )
-            datatype, kind, sample_rate, frequency = _parse_sigmf_meta(
-                _read_member(archive, meta_member)
-            )
-            what = "The archive's .sigmf-data file"
-            _check_size(data_member.size, kind, what)
-            samples = _decode(_read_member(archive, data_member), kind, what)
-    except tarfile.TarError as exc:
+        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
+        members = archive.getmembers()
+    except Exception as exc:
+        # Hostile headers make tarfile fail in many ways (OverflowError for huge
+        # sizes, ValueError for bad PAX records), and its messages can repeat
+        # text from the file, so every failure gets this one message.
         raise ValueError(
             "This .sigmf file could not be read as an uncompressed tar archive. "
             "It may be damaged, truncated, or compressed."
         ) from exc
+    with archive:
+        # tarfile stops quietly at a cut-off header, so only end-of-archive
+        # zero padding may follow the last member it read.
+        if archive.offset > len(data) or data[archive.offset :].strip(b"\0"):
+            raise ValueError(_DAMAGED_ARCHIVE)
+        meta_member, data_member = _sigmf_members(members)
+        # Check each size before reading the member into memory.
+        if meta_member.size > SIGMF_META_MAX_BYTES:
+            raise ValueError(
+                f"The SigMF metadata exceeds the {format_size(SIGMF_META_MAX_BYTES)} limit."
+            )
+        datatype, kind, sample_rate, frequency = _parse_sigmf_meta(
+            _read_member(archive, meta_member)
+        )
+        what = "The archive's .sigmf-data file"
+        _check_size(data_member.size, kind, what)
+        samples = _decode(_read_member(archive, data_member), kind, what)
     return Recording(samples, sample_rate, frequency, f"SigMF archive ({datatype})")
 
 
@@ -337,11 +375,41 @@ def load_recording(name: str, data: bytes) -> Recording:
             "A SigMF recording needs both files. Upload the .sigmf-meta and "
             ".sigmf-data files together, or a single .sigmf archive."
         )
+    # Only a plain extension of the name is repeated.
+    if _PLAIN_EXTENSION.fullmatch(extension):
+        shown = f"The .{extension} format"
+    else:
+        shown = "This file's format"
     raise ValueError(
-        f'The format of "{name[:80]}" is not supported. Use a file ending in '
+        f"{shown} is not supported. Use a file ending in "
         + ", ".join(f".{item}" for item in SUPPORTED_EXTENSIONS)
         + "."
     )
+
+
+def select_uploads(
+    files: Sequence[tuple[str, Upload]],
+) -> tuple[tuple[tuple[str, Upload], ...], int]:
+    """The (name, upload) pairs to read and how many earlier ones are ignored.
+
+    Files are given in the order they were added; a multiple-file uploader keeps
+    earlier choices when more are added. The last file is read, together with
+    the other half of its SigMF pair when it is a .sigmf-meta or .sigmf-data
+    file: the most recent one with the same name, or else the most recent one
+    of the other kind, which load_uploads then reports as mismatched. Only the
+    names are used, so the uploads can be read after choosing.
+    """
+    if not files:
+        return (), 0
+    *earlier, last = files
+    partner = _SIGMF_PAIR.get(_extension(last[0]))
+    selected = [last]
+    if partner is not None:
+        others = [item for item in earlier if _extension(item[0]) == partner]
+        stem = PurePosixPath(last[0]).stem
+        matching = [item for item in others if PurePosixPath(item[0]).stem == stem]
+        selected = (matching or others)[-1:] + selected
+    return tuple(selected), len(files) - len(selected)
 
 
 def load_uploads(files: Sequence[tuple[str, bytes]]) -> Recording:

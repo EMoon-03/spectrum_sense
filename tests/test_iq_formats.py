@@ -22,6 +22,7 @@ from iq_formats import (
     load_recording,
     load_sigmf_pair,
     load_uploads,
+    select_uploads,
 )
 from signal_config import SAMPLES_PER_WINDOW
 
@@ -37,6 +38,9 @@ RAW_COMPONENTS = {
     "cu8": "u1",
 }
 SIGMF_COMPONENTS = {"cf32_le": "<f4", "ci16_le": "<i2", "ci8": "i1", "cu8": "u1"}
+# Text a shared file could carry to make the app's error box show a link.
+HOSTILE_TEXT = "![](https://e.example/p.png)[Get the fixed file](https://e.example)"
+UNREADABLE = "could not be read as an uncompressed tar archive"
 
 
 def interleaved(components, dtype: str, samples: int = SAMPLES_PER_WINDOW) -> bytes:
@@ -96,6 +100,32 @@ def tar_bytes(entries) -> bytes:
         for info, payload in entries:
             archive.addfile(info, None if payload is None else BytesIO(payload))
     return buffer.getvalue()
+
+
+def fix_checksum(raw: bytearray, header: int) -> None:
+    """Recompute the checksum of the tar header at this byte offset."""
+    raw[header + 148 : header + 156] = b" " * 8
+    raw[header + 148 : header + 156] = b"%06o\0 " % sum(raw[header : header + 512])
+
+
+def set_gnu_size(archive: bytes, header: int, size: int) -> bytes:
+    """Give the header at this byte offset a GNU base-256 size field (no PAX
+    record needed) and a valid checksum."""
+    raw = bytearray(archive)
+    raw[header + 124 : header + 136] = bytes([0x80]) + size.to_bytes(11, "big")
+    fix_checksum(raw, header)
+    return bytes(raw)
+
+
+def assert_plain_message(test: unittest.TestCase, error: BaseException) -> str:
+    """The message of a ValueError, checked to repeat no hostile text and to be
+    sendable to a browser as UTF-8."""
+    test.assertIsInstance(error, ValueError)
+    message = str(error)
+    message.encode("utf-8")  # A lone surrogate would raise here.
+    for fragment in ("e.example", "](", "\ud800", "\udcff"):
+        test.assertNotIn(fragment, message)
+    return message
 
 
 def sigmf_archive(meta: bytes, data: bytes, name: str = "recording", extra=()) -> bytes:
@@ -276,6 +306,13 @@ class NpyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "holds a .* array with shape"):
                     load_recording("x.npy", npy(array))
 
+    def test_structured_field_names_are_not_repeated(self):
+        array = np.zeros(SAMPLES_PER_WINDOW, dtype=[(HOSTILE_TEXT, "<f4"), ("q", "<f4")])
+        with self.assertRaises(ValueError) as caught:
+            load_recording("x.npy", npy(array))
+        message = assert_plain_message(self, caught.exception)
+        self.assertIn("holds a structured array with shape (1024,)", message)
+
     def test_object_arrays_are_rejected_without_unpickling(self):
         unpickled.clear()
         array = np.array([Tripwire()] * SAMPLES_PER_WINDOW, dtype=object)
@@ -367,10 +404,26 @@ class SigmfArchiveTests(unittest.TestCase):
 
     def test_unsupported_datatypes_are_named(self):
         data = interleaved([1, 2], "<f4")
-        for datatype in ("rf32_le", "cf32_be", "ci16_be", "cu16_le", "cf64_le", "mystery"):
+        for datatype in ("rf32_le", "cf32_be", "ci16_be", "cu16_le", "cf64_le", "ri8"):
             with self.subTest(datatype=datatype):
                 with self.assertRaisesRegex(ValueError, f'datatype "{datatype}" is not supported'):
                     load_recording("x.sigmf", sigmf_archive(sigmf_meta(datatype), data))
+
+    def test_malformed_datatypes_are_described_without_repeating_them(self):
+        # JSON's "\ud800" decodes to a lone surrogate, which cannot be sent to
+        # a browser, and Markdown would turn a link into a clickable one.
+        data = interleaved([1, 2], "<f4")
+        for datatype in ("mystery", "\ud800", HOSTILE_TEXT, "CF32_LE", "cf32_le ", "_cf32_le_"):
+            with self.subTest(datatype=datatype):
+                for load in (
+                    lambda meta: load_recording("x.sigmf", sigmf_archive(meta, data)),
+                    lambda meta: load_uploads([("x.sigmf-meta", meta), ("x.sigmf-data", data)]),
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        load(sigmf_meta(datatype))
+                    message = assert_plain_message(self, caught.exception)
+                    self.assertIn("is not a valid SigMF datatype", message)
+                    self.assertNotIn(datatype, message)
 
     def test_invalid_metadata_is_explained(self):
         data = interleaved([1, 2], "<f4")
@@ -424,6 +477,111 @@ class SigmfArchiveTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unsafe path"):
             load_recording("x.sigmf", traversing)
+
+    def test_member_names_are_never_repeated(self):
+        meta, data = sigmf_meta(), interleaved([1, 2], "<f4")
+        link = special(HOSTILE_TEXT, tarfile.SYMTYPE, "recording/recording.sigmf-meta")
+        absolute = regular("/" + HOSTILE_TEXT, b"x")
+        # tarfile reads a name that is not UTF-8 with lone surrogates in it.
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            archive.addfile(regular("r.sigmf-meta", meta)[0], BytesIO(meta))
+            archive.addfile(special("r\udcff.sigmf-data", tarfile.SYMTYPE, "r.sigmf-meta")[0])
+        self.assertIn(b"r\xff.sigmf-data", buffer.getvalue())
+        for archive, message in (
+            (sigmf_archive(meta, data, extra=[link]), "link or special file"),
+            (sigmf_archive(meta, data, extra=[absolute]), "unsafe path"),
+            (buffer.getvalue(), "link or special file"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as caught:
+                    load_recording("x.sigmf", archive)
+                self.assertIn(message, assert_plain_message(self, caught.exception))
+
+    def test_macos_metadata_entries_are_ignored(self):
+        # macOS tar adds an AppleDouble "._" file for each file with extended
+        # attributes, such as a download's quarantine flag.
+        samples = random_complex().astype(np.complex64)
+        meta = sigmf_meta(sample_rate=1e6)
+        apple_double = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        " + bytes(40)
+        archive = tar_bytes(
+            [
+                special("rec", tarfile.DIRTYPE),
+                regular("rec/._rec.sigmf-meta", apple_double),
+                regular("rec/rec.sigmf-meta", meta),
+                regular("rec/._rec.sigmf-data", apple_double),
+                regular("rec/rec.sigmf-data", samples.tobytes()),
+                regular("__MACOSX/rec/._rec.sigmf-data", apple_double),
+            ]
+        )
+        recording = load_recording("rec.sigmf", archive)
+        np.testing.assert_array_equal(recording.samples, samples.astype(np.complex128))
+        self.assertEqual(recording.sample_rate, 1e6)
+        # Finder information alone is not a recording.
+        only_finder_info = tar_bytes(
+            [regular("rec/._rec.sigmf-meta", apple_double), regular("rec/rec.sigmf-data", samples.tobytes())]
+        )
+        with self.assertRaisesRegex(ValueError, "no .sigmf-meta"):
+            load_recording("rec.sigmf", only_finder_info)
+
+    def test_hostile_headers_give_one_plain_error(self):
+        meta, data = sigmf_meta(), interleaved([1, 2], "<f4")
+
+        def pax_archive(target: str, pax_headers: dict) -> bytes:
+            entries = [regular("r.sigmf-meta", meta), regular("r.sigmf-data", data)]
+            for info, _ in entries:
+                if info.name.endswith(target):
+                    info.pax_headers = pax_headers
+            return tar_bytes(entries)
+
+        plain = tar_bytes([regular("r.sigmf-meta", meta), regular("r.sigmf-data", data)])
+        # The data member's header follows the metadata header and its block.
+        data_header = 512 + -(-len(meta) // 512) * 512
+        cases = {
+            # A size too large for a C integer makes tarfile raise OverflowError.
+            "PAX size 2**63": pax_archive("data", {"size": str(2**63)}),
+            "PAX size 2**63 - 1": pax_archive("data", {"size": str(2**63 - 1)}),
+            "PAX size 2**64 on the metadata": pax_archive("meta", {"size": str(2**64)}),
+            "GNU base-256 size": set_gnu_size(plain, data_header, 2**70),
+            # tarfile's own message would repeat the PAX value.
+            "bad sparse map": pax_archive(
+                "meta", {"GNU.sparse.map": f"**Damaged.** {HOSTILE_TEXT}", "GNU.sparse.size": "8"}
+            ),
+            "bad sparse count": pax_archive(
+                "meta", {"GNU.sparse.map": "0.0", "GNU.sparse.size": "8"}
+            ),
+        }
+        for name, archive in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as caught:
+                    load_recording("x.sigmf", archive)
+                message = assert_plain_message(self, caught.exception)
+                self.assertRegex(message, f"{UNREADABLE}|truncated or damaged")
+
+    def test_damaged_headers_only_ever_raise_value_errors(self):
+        # Change random header bytes, sometimes turning a size field into a
+        # huge or negative GNU base-256 number (first byte 0x80 or 0xFF), and
+        # fix the checksums so that tarfile parses the damaged fields. Each
+        # archive either loads or fails with a plain ValueError.
+        meta = sigmf_meta(sample_rate=1e6)
+        archive = sigmf_archive(meta, interleaved([1, 2], "<f4"))
+        headers = [0, 512, 1024 + -(-len(meta) // 512) * 512]
+        rng = np.random.default_rng(0)
+        for trial in range(400):
+            damaged = bytearray(archive)
+            for _ in range(int(rng.integers(1, 6))):
+                header = int(rng.choice(headers))
+                if rng.random() < 0.25:
+                    damaged[header + 124] = int(rng.choice([0x80, 0xFF]))
+                else:
+                    damaged[header + int(rng.integers(0, 512))] = int(rng.integers(0, 256))
+                fix_checksum(damaged, header)
+            try:
+                load_recording("x.sigmf", bytes(damaged))
+            except ValueError as error:
+                assert_plain_message(self, error)
+            except Exception as error:  # noqa: BLE001 - any other type is the bug.
+                self.fail(f"trial {trial}: {type(error).__name__}: {error!r}")
 
     def test_links_and_special_files_are_rejected(self):
         meta = sigmf_meta()
@@ -504,6 +662,65 @@ class SigmfArchiveTests(unittest.TestCase):
                     load_recording("x.sigmf", sigmf_archive(sigmf_meta(), data))
 
 
+class SelectUploadsTests(unittest.TestCase):
+    """The uploader keeps earlier files when more are added; the newest is read."""
+
+    @staticmethod
+    def names(files) -> list[str]:
+        return [name for name, _ in files]
+
+    def select(self, *names: str) -> tuple[list[str], int]:
+        files, ignored = select_uploads([(name, name.encode()) for name in names])
+        self.assertEqual([data for _, data in files], [name.encode() for name, _ in files])
+        return self.names(files), ignored
+
+    def test_the_last_file_is_read(self):
+        for names, expected in (
+            (["a.csv"], (["a.csv"], 0)),
+            (["a.csv", "b.csv"], (["b.csv"], 1)),
+            (["a.sigmf-meta", "a.sigmf-data", "b.cu8"], (["b.cu8"], 2)),
+            ([], ([], 0)),
+        ):
+            with self.subTest(names=names):
+                self.assertEqual(self.select(*names), expected)
+
+    def test_the_last_file_brings_the_other_half_of_its_sigmf_pair(self):
+        for names, expected in (
+            (["rec.sigmf-data", "rec.sigmf-meta"], (["rec.sigmf-data", "rec.sigmf-meta"], 0)),
+            (["x.csv", "rec.sigmf-meta", "rec.sigmf-data"], (["rec.sigmf-meta", "rec.sigmf-data"], 1)),
+            (
+                ["a.sigmf-meta", "a.sigmf-data", "b.sigmf-meta", "b.SIGMF-DATA"],
+                (["b.sigmf-meta", "b.SIGMF-DATA"], 2),
+            ),
+            (
+                ["b.sigmf-data", "a.sigmf-meta", "a.sigmf-data", "b.sigmf-meta"],
+                (["b.sigmf-data", "b.sigmf-meta"], 2),
+            ),
+            (["a.sigmf-meta", "a.sigmf-data", "a.sigmf-data"], (["a.sigmf-meta", "a.sigmf-data"], 1)),
+            # Without a match, the other kind is paired so that the names can be reported.
+            (["a.sigmf-meta", "b.sigmf-data"], (["a.sigmf-meta", "b.sigmf-data"], 0)),
+            (["x.csv", "rec.sigmf-meta"], (["rec.sigmf-meta"], 1)),
+        ):
+            with self.subTest(names=names):
+                self.assertEqual(self.select(*names), expected)
+
+    def test_selected_files_load(self):
+        first = to_csv(random_complex(seed=1)).encode()
+        second = random_complex(2 * SAMPLES_PER_WINDOW, seed=2)
+        files, ignored = select_uploads([("a.csv", first), ("b.csv", to_csv(second).encode())])
+        self.assertEqual(ignored, 1)
+        np.testing.assert_array_equal(load_uploads(files).samples, second)
+        meta, data = sigmf_meta(), random_complex().astype(np.complex64).tobytes()
+        for names, message in (
+            (["x.csv", "rec.sigmf-meta"], "needs both files"),
+            (["a.sigmf-meta", "b.sigmf-data"], "different names"),
+        ):
+            with self.subTest(names=names):
+                uploads = [(name, meta if name.endswith("meta") else data) for name in names]
+                with self.assertRaisesRegex(ValueError, message):
+                    load_uploads(select_uploads(uploads)[0])
+
+
 class SigmfPairTests(unittest.TestCase):
     def setUp(self):
         self.samples = random_complex().astype(np.complex64)
@@ -575,6 +792,18 @@ class DispatchTests(unittest.TestCase):
                     load_recording(name, b"\0" * 4096)
                 for extension in SUPPORTED_EXTENSIONS:
                     self.assertIn(f".{extension}", str(caught.exception))
+
+    def test_only_a_plain_extension_of_the_name_is_repeated(self):
+        for name, start in (
+            ("Recording.WAV", "The .wav format is not supported."),
+            ("recording", "This file's format is not supported."),
+            (f"x.{HOSTILE_TEXT}", "This file's format is not supported."),
+            ("x.w\ud800v", "This file's format is not supported."),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError) as caught:
+                    load_recording(name, b"\0" * 4096)
+                self.assertTrue(assert_plain_message(self, caught.exception).startswith(start))
 
     def test_upload_widget_limit_covers_every_reader(self):
         largest_raw = MAX_SAMPLES * 8
