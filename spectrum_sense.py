@@ -17,12 +17,13 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-
-CLASSES = ("noise", "BPSK", "QPSK")
-SAMPLES_PER_SYMBOL = 8
-SAMPLES_PER_WINDOW = 1024
-SNR_DB_RANGE = (-2.0, 14.0)
-FREQ_OFFSET_RANGE = (-0.008, 0.008)  # cycles per sample, relative to baseband
+from signal_config import (
+    CLASSES,
+    FREQ_OFFSET_RANGE,
+    SAMPLES_PER_SYMBOL,
+    SAMPLES_PER_WINDOW,
+    SNR_DB_RANGE,
+)
 
 
 def complex_gaussian(rng: np.random.Generator, size: int) -> np.ndarray:
@@ -82,25 +83,49 @@ def generate_capture(
 
 
 def extract_features(window: np.ndarray) -> np.ndarray:
-    """Phase-invariant moments and short-lag correlation of an I/Q window."""
+    """Amplitude- and phase-invariant features of a finite, nonzero I/Q window.
+
+    Invalid windows raise ValueError; the caller's samples are left unchanged.
+    """
+    window = np.asarray(window, dtype=np.complex128)
+    if window.ndim != 1 or window.size <= SAMPLES_PER_SYMBOL:
+        raise ValueError(
+            f"Provide a one-dimensional window of at least {SAMPLES_PER_SYMBOL + 1} samples."
+        )
+    if not np.isfinite(window).all():
+        raise ValueError("The I/Q window must contain only finite values.")
+
+    # Scale components separately: complex magnitude can overflow near float64's
+    # maximum, and complex division can overflow for subnormal scale factors.
+    scale = max(np.max(np.abs(window.real)), np.max(np.abs(window.imag)))
+    if scale == 0:
+        raise ValueError(
+            "The I/Q window contains only zeros. Choose a window with nonzero samples."
+        )
+    normalized = np.empty_like(window)
+    normalized.real = window.real / scale
+    normalized.imag = window.imag / scale
+    normalized /= np.sqrt(np.mean(np.abs(normalized) ** 2))
+    window = normalized
+
     n = len(window)
     # Estimate carrier rotation from adjacent samples, then remove it. For pure
     # noise this estimate is arbitrary, which is fine for this baseline.
     lag_one = np.mean(window[1:] * np.conj(window[:-1]))
     freq_est = np.angle(lag_one) / (2 * np.pi)
     x = window * np.exp(-2j * np.pi * freq_est * np.arange(n))
-    power = np.mean(np.abs(x) ** 2) + 1e-12
+    power = np.mean(np.abs(x) ** 2)
     amplitude = np.abs(x)
     # Symbol-spaced phase differences distinguish binary from quadrature
     # phase transitions while discarding a constant carrier phase.
     symbol_difference = window[SAMPLES_PER_SYMBOL:] * np.conj(
         window[:-SAMPLES_PER_SYMBOL]
     )
-    return np.array(
+    features = np.array(
         [
             np.abs(np.mean(x**2)) / power,
             np.abs(np.mean(x**4)) / power**2,
-            float(np.std(amplitude) / (np.mean(amplitude) + 1e-12)),
+            float(np.std(amplitude) / np.mean(amplitude)),
             float(np.mean(amplitude**4) / power**2),
             np.abs(lag_one) / power,
             np.abs(np.mean(x[SAMPLES_PER_SYMBOL:] * np.conj(x[:-SAMPLES_PER_SYMBOL])))
@@ -110,6 +135,9 @@ def extract_features(window: np.ndarray) -> np.ndarray:
         ],
         dtype=float,
     )
+    if not np.isfinite(features).all():
+        raise ValueError("Could not compute finite features for this I/Q window.")
+    return features
 
 
 def make_dataset(rng: np.random.Generator, captures_per_class: int, windows: int):

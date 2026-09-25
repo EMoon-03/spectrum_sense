@@ -12,16 +12,14 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from iq_csv import from_csv, to_csv
-from spectrum_sense import (
+from signal_config import (
     CLASSES,
     FREQ_OFFSET_RANGE,
     SAMPLES_PER_SYMBOL,
     SAMPLES_PER_WINDOW,
     SNR_DB_RANGE,
-    extract_features,
-    generate_capture,
-    make_dataset,
 )
+from spectrum_sense import extract_features, generate_capture, make_dataset
 
 
 st.set_page_config(page_title="SpectrumSense Signal Lab", page_icon="📡", layout="wide")
@@ -74,7 +72,14 @@ def signal_plots(samples: np.ndarray, section: str) -> None:
     )
 
     frequencies = np.fft.fftshift(np.fft.fftfreq(len(samples)))
-    spectrum = 20 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(samples))) + 1e-8)
+    # Scale before the FFT, then restore the original magnitude in log space.
+    # Keep the noise floor positive even for zero or subnormal input samples.
+    fft_scale = max(1.0, np.max(np.abs(samples.real)), np.max(np.abs(samples.imag)))
+    fft_samples = np.empty_like(samples)
+    fft_samples.real = samples.real / fft_scale
+    fft_samples.imag = samples.imag / fft_scale
+    magnitude = np.abs(np.fft.fftshift(np.fft.fft(fft_samples)))
+    spectrum = 20 * (np.log10(magnitude + 1e-8 / fft_scale) + np.log10(fft_scale))
     fft_plot = go.Figure(go.Scatter(x=frequencies, y=spectrum, mode="lines"))
     fft_plot.update_layout(
         title="FFT magnitude", xaxis_title="Cycles per sample", yaxis_title="Magnitude (dB)", height=300
@@ -179,7 +184,10 @@ with upload_tab:
                 "The prediction is exploratory. It assumes the toy model's symbol timing "
                 "and training conditions and cannot identify arbitrary real-world radio traffic."
             )
-            show_prediction(model, window, "uploaded")
+            try:
+                show_prediction(model, window, "uploaded")
+            except ValueError as exc:
+                st.error(str(exc))
             signal_plots(window, "uploaded")
 
 with about_tab:

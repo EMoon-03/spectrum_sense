@@ -33,6 +33,24 @@ The app has three tabs:
 - **How the model works:** inspect its grouped test accuracy and learn what the
   synthetic score does and does not establish.
 
+CSV exports preserve the precision of the float64 I/Q components. These files
+can be larger than rounded exports; imports still allow at most 2 MB and
+100,000 samples. Invalid CSV syntax is reported with a line number. Feature
+extraction normalizes a copy of each window to avoid amplitude overflow and
+leaves the imported samples unchanged. All-zero windows can be plotted but
+cannot be classified.
+
+## Run the regression tests
+
+With the dependencies installed, run:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The tests cover CSV validation and limits, lossless float64 interchange, and
+feature extraction and app uploads for extreme amplitudes.
+
 ## Run the command-line baseline
 
 In the same folder:
