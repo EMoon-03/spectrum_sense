@@ -8,6 +8,16 @@ import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 
+from explore_url import (
+    OFFSET,
+    SEED,
+    SNR,
+    URL_KEYS,
+    ExploreSettings,
+    explore_params,
+    explore_settings,
+    parse_explore_params,
+)
 from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, to_csv
 from iq_formats import MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, Recording, load_uploads
 from signal_config import (
@@ -81,6 +91,16 @@ UNCERTAIN_NOTE = (
     f"{PROBE_KINDS[-1]}). It is not validated unknown-signal detection: it can miss "
     "unfamiliar signals, and very-low-SNR signals can still be called noise."
 )
+# Session State keys of the Explore controls, by ExploreSettings field.
+CONTROL_KEYS = {
+    "signal": "explore_signal",
+    "snr_db": "explore_snr",
+    "offset": "explore_offset",
+    "seed": "explore_seed",
+}
+# The settings that the URL describes, and notes about a link's unusable values.
+URL_SETTINGS = "explore_url_settings"
+URL_NOTES = "explore_url_notes"
 
 
 @st.cache_resource(show_spinner="Training the synthetic baseline…")
@@ -124,6 +144,32 @@ def example_csv() -> str:
     """A fixed simulated BPSK recording that the upload tab always accepts."""
     capture, _, _ = generate_capture("BPSK", np.random.default_rng(2024), windows=EXAMPLE_WINDOWS)
     return to_csv(capture.ravel())
+
+
+def load_settings_from_url() -> None:
+    """Read the Explore settings from the URL on a session's first run only, and
+    give each control without a value its setting. Later runs trust the
+    controls, so a URL that the browser has not updated yet cannot reset them."""
+    if URL_SETTINGS not in st.session_state:
+        params = {key: values for key in URL_KEYS if (values := st.query_params.get_all(key))}
+        settings, notes = parse_explore_params(params)
+        st.session_state[URL_SETTINGS] = settings
+        st.session_state[URL_NOTES] = notes
+    settings = st.session_state[URL_SETTINGS]
+    for field, key in CONTROL_KEYS.items():
+        if key not in st.session_state:
+            st.session_state[key] = getattr(settings, field)
+
+
+def save_settings_to_url(settings: ExploreSettings) -> None:
+    """Write changed settings to the URL, which updates the browser's address bar
+    without a rerun. Other query parameters are kept, and a link is not rewritten
+    just because it was opened."""
+    if settings == st.session_state[URL_SETTINGS]:
+        return
+    st.query_params.update(explore_params(settings))
+    st.session_state[URL_SETTINGS] = settings
+    st.session_state[URL_NOTES] = []
 
 
 def signal_plots(
@@ -330,24 +376,32 @@ lab_tab, upload_tab, about_tab = st.tabs(["Explore a signal", "Try your own reco
 
 with lab_tab:
     st.header("Create a simulated recording")
+    load_settings_from_url()
     controls, explanation = st.columns([2, 3])
+    # The URL sets the controls through Session State, so they take no default.
     with controls:
         label = st.selectbox(
-            "Signal type", CLASSES, index=1,
+            "Signal type", CLASSES, key=CONTROL_KEYS["signal"],
             help="Noise alone, or random bits sent as two phases (BPSK) or four phases (QPSK).",
         )
         snr = st.slider(
-            "Signal-to-noise ratio (dB)", -12.0, 20.0, 6.0, 1.0, disabled=(label == "noise"),
+            "Signal-to-noise ratio (dB)", SNR.minimum, SNR.maximum, step=SNR.step,
+            key=CONTROL_KEYS["snr_db"], disabled=(label == "noise"),
             help="How strong the signal is compared with the noise; it does not apply to noise alone.",
         )
         offset = st.slider(
-            "Carrier offset (cycles/sample)", -0.030, 0.030, 0.000, 0.001,
+            "Carrier offset (cycles/sample)", OFFSET.minimum, OFFSET.maximum, step=OFFSET.step,
+            format="%.3f", key=CONTROL_KEYS["offset"],
             help="A frequency mismatch between transmitter and receiver that makes the I/Q points rotate.",
         )
         seed = st.number_input(
-            "Example seed", min_value=0, max_value=1_000_000, value=42, step=1,
+            "Example seed", min_value=SEED.minimum, max_value=SEED.maximum, step=SEED.step,
+            key=CONTROL_KEYS["seed"],
             help="The same seed always gives the same recording; change it for new random bits and noise.",
         )
+        st.caption("To share this exact example, copy the address from your browser's address bar.")
+    settings = explore_settings(label, snr, offset, seed)
+    save_settings_to_url(settings)
     with explanation:
         st.markdown(
             "**What the controls mean**\n\n"
@@ -356,20 +410,27 @@ with lab_tab:
             "- **Carrier offset:** shifts and rotates the received signal.\n"
             "- **Example seed:** change it to generate another random message and noise pattern."
         )
-        if label != "noise" and not (SNR_DB_RANGE[0] <= snr <= SNR_DB_RANGE[1]):
+        if st.session_state[URL_NOTES]:
+            st.info(
+                "Part of this link could not be used as given:\n\n"
+                + "\n".join(f"- {note}" for note in st.session_state[URL_NOTES])
+            )
+        if label != "noise" and not (SNR_DB_RANGE[0] <= settings.snr_db <= SNR_DB_RANGE[1]):
             st.info(
                 "This SNR is outside the demo model's training range. Watch how the answer "
                 "and scores change."
             )
-        if not (FREQ_OFFSET_RANGE[0] <= offset <= FREQ_OFFSET_RANGE[1]):
+        if not (FREQ_OFFSET_RANGE[0] <= settings.offset <= FREQ_OFFSET_RANGE[1]):
             st.info("This carrier offset is outside the demo model's training range.")
 
     recording, _, _ = generate_capture(
-        label, np.random.default_rng(int(seed)), windows=1,
-        snr_db_override=snr, freq_offset_override=offset,
+        settings.signal, np.random.default_rng(settings.seed), windows=1,
+        snr_db_override=settings.snr_db, freq_offset_override=settings.offset,
     )
     selected_samples = recording[0]
-    st.caption(f"Actual simulated type: **{label}** · {len(selected_samples)} I/Q samples")
+    st.caption(
+        f"Actual simulated type: **{settings.signal}** · {len(selected_samples)} I/Q samples"
+    )
     show_prediction(model, selected_samples, "lab")
     signal_plots(selected_samples, "lab")
     st.download_button(

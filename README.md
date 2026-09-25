@@ -26,7 +26,14 @@ The app has three tabs:
 
 - **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR, carrier offset,
   and random seed; inspect zoomable plots and the model's answer and scores.
-  Download your example as a CSV.
+  Download your example as a CSV. The page address holds the four settings,
+  for example `http://localhost:8501/?signal=QPSK&snr=3&offset=0.012&seed=7`,
+  so you can bookmark or share the exact example. A link's values are checked
+  when it opens: numbers outside a control's range or between its steps move
+  to the nearest allowed value, anything else falls back to the default, and a
+  short note lists what changed. Each change also adds a browser history
+  entry; going back changes the address but not the controls, so reload the
+  page to open an earlier address.
 - **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
   samples (see the formats below). Every complete 1,024-sample window is
   classified: a timeline shows the answer for each window, a table counts the
@@ -127,8 +134,8 @@ With the dependencies installed, run:
 The tests cover CSV validation and limits, lossless float64 interchange, the
 raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
 extreme amplitudes, the "uncertain" answer and its probe signals, whole-file
-classification and its CSV, the spectrogram, and the chart summaries and other
-accessibility features.
+classification and its CSV, the spectrogram, the shareable Explore links, and
+the chart summaries and other accessibility features.
 
 ## Run the command-line baseline
 

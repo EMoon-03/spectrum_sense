@@ -44,6 +44,9 @@ APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 CAN_UPLOAD = hasattr(getattr(element_tree, "FileUploader", None), "set_value")
 EXAMPLE_LABEL = "Download an example CSV"
 RESULTS_LABEL = "Download per-window results as CSV"
+LAB_DOWNLOAD_LABEL = "Download this I/Q example as CSV"
+SHARE_HINT = "To share this exact example, copy the address from your browser's address bar."
+LINK_NOTE_START = "Part of this link could not be used as given:"
 # The text summary that must sit directly under each chart, by chart key.
 SUMMARY_STARTS = {
     "scores": "Scores: ",
@@ -104,18 +107,21 @@ def sigmf_archive(meta: bytes, data: bytes) -> bytes:
 class AppTestCase(unittest.TestCase):
     """Helpers for running the app; the tests are in the subclasses."""
 
-    def run_app(self, *uploads):
-        """Run the app with uploads given as (file name, contents) pairs."""
+    def run_app(self, *uploads, query_params: dict | None = None):
+        """Run the app with uploads given as (file name, contents) pairs, opened
+        at a URL with the given query parameters."""
         files = [named_upload(name, payload) for name, payload in uploads]
+        app = AppTest.from_file(str(APP_PATH))
+        app.query_params.update(query_params or {})
         with patch("streamlit.file_uploader", return_value=files):
-            app = AppTest.from_file(str(APP_PATH)).run(timeout=20)
+            app = app.run(timeout=20)
         self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
         return app
 
     def run_csv(self, payload: bytes):
         return self.run_app(("recording.csv", payload))
 
-    def run_and_record_downloads(self, *uploads):
+    def run_and_record_downloads(self, *uploads, query_params: dict | None = None):
         """Run the app and return it with the data of each download button, by label."""
         downloads = {}
         download_button = st.download_button
@@ -125,7 +131,7 @@ class AppTestCase(unittest.TestCase):
             return download_button(label, data, *args, **kwargs)
 
         with patch("streamlit.download_button", new=recording_download_button):
-            app = self.run_app(*uploads)
+            app = self.run_app(*uploads, query_params=query_params)
         return app, downloads
 
     def chart_summaries(self, block) -> dict[str, str]:
@@ -450,6 +456,114 @@ class AccessibilityTests(AppTestCase):
         self.assertIn(EXAMPLE_LABEL, labels)
         self.assertEqual(len(app.error), 0)
         self.assertIn("Showing window 1 of 2", " ".join(caption.value for caption in app.caption))
+
+
+class ShareableUrlTests(AppTestCase):
+    @staticmethod
+    def controls(app) -> tuple:
+        """The Explore tab's signal type, SNR, carrier offset, and seed."""
+        return (
+            app.selectbox(key="explore_signal").value,
+            app.slider(key="explore_snr").value,
+            app.slider(key="explore_offset").value,
+            app.number_input(key="explore_seed").value,
+        )
+
+    @staticmethod
+    def link_notes(block) -> list[str]:
+        return [item.value for item in block.info if item.value.startswith(LINK_NOTE_START)]
+
+    @staticmethod
+    def expected_csv(signal: str, snr: float, offset: float, seed: int) -> str:
+        recording, _, _ = generate_capture(
+            signal, np.random.default_rng(seed), windows=1,
+            snr_db_override=snr, freq_offset_override=offset,
+        )
+        return to_csv(recording[0])
+
+    def test_a_link_sets_the_controls_without_changing_other_tabs(self):
+        link = {"signal": "QPSK", "snr": "3", "offset": "0.012", "seed": "7"}
+        example = self.expected_csv("QPSK", 3.0, 0.012, 7)
+        app, downloads = self.run_and_record_downloads(
+            ("recording.csv", example.encode()), query_params=link
+        )
+        self.assertEqual(self.controls(app), ("QPSK", 3.0, 0.012, 7))
+        self.assertEqual(downloads[LAB_DOWNLOAD_LABEL], example)
+        lab = app.tabs[0]
+        self.assertIn(SHARE_HINT, [caption.value for caption in lab.caption])
+        self.assertIn("Actual simulated type: **QPSK**", " ".join(c.value for c in lab.caption))
+        self.assertEqual(self.link_notes(app), [])
+        # Opening a link never rewrites it.
+        self.assertEqual(app.query_params, {key: [value] for key, value in link.items()})
+        # The upload tab works as before and the link does not touch it.
+        self.assertEqual(len(app.error), 0)
+        self.assertEqual(self.uploaded_charts(app), UPLOAD_CHARTS)
+        self.assertIn("Showing window 1 of 1", " ".join(c.value for c in app.caption))
+
+    def test_unusable_link_values_fall_back_with_a_short_note(self):
+        link = {
+            "signal": "8PSK", "snr": "[here](https://example.com)", "offset": "0.5",
+            "seed": ["1", "2"], "utm_source": "mail",
+        }
+        app = self.run_app(query_params=link)
+        self.assertEqual(self.controls(app), ("BPSK", 6.0, 0.03, 42))
+        (note,) = self.link_notes(app)
+        self.assertEqual(self.link_notes(app.tabs[0]), [note])
+        bullets = [line for line in note.splitlines() if line.startswith("- ")]
+        self.assertEqual(len(bullets), 4, note)
+        for words in (
+            "signal type was ignored", "SNR was ignored", "offset of 0.5", "seed was ignored",
+        ):
+            self.assertIn(words, note)
+        self.assertNotIn("example.com", note)
+        # The link stays as opened; reopening it shows the same example and note.
+        self.assertEqual(
+            app.query_params,
+            {
+                "signal": ["8PSK"], "snr": [link["snr"]], "offset": ["0.5"], "seed": ["1", "2"],
+                "utm_source": ["mail"],
+            },
+        )
+
+        # The note describes the link, so it goes once a control changes.
+        app = app.number_input(key="explore_seed").set_value(8).run(timeout=20)
+        self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
+        self.assertEqual(self.link_notes(app), [])
+        self.assertEqual(
+            app.query_params,
+            {
+                "signal": ["BPSK"], "snr": ["6"], "offset": ["0.03"], "seed": ["8"],
+                "utm_source": ["mail"],
+            },
+        )
+
+    def test_changing_a_control_updates_the_url_that_reproduces_the_example(self):
+        app = self.run_app(query_params={"utm_source": "mail"})
+        self.assertEqual(self.controls(app), ("BPSK", 6.0, 0.0, 42))
+        self.assertEqual(app.query_params, {"utm_source": ["mail"]})
+
+        app = app.slider(key="explore_offset").set_value(0.005).run(timeout=20)
+        app = app.selectbox(key="explore_signal").set_value("noise").run(timeout=20)
+        app = app.number_input(key="explore_seed").set_value(7).run(timeout=20)
+        self.assertEqual(len(app.exception), 0, [item.message for item in app.exception])
+        written = {"signal": ["noise"], "snr": ["6"], "offset": ["0.005"], "seed": ["7"]}
+        self.assertEqual(app.query_params, {**written, "utm_source": ["mail"]})
+        self.assertTrue(app.slider(key="explore_snr").disabled)
+
+        # A rerun without changes leaves the URL alone. Later runs trust the
+        # controls, so a URL from before the last change cannot reset them.
+        app = app.run(timeout=20)
+        self.assertEqual(app.query_params, {**written, "utm_source": ["mail"]})
+        app.query_params.clear()
+        app.query_params.update({"signal": ["QPSK"], "seed": ["1"]})
+        app = app.run(timeout=20)
+        self.assertEqual(self.controls(app), ("noise", 6.0, 0.005, 7))
+
+        # Opening the written URL in a new session shows exactly the same example.
+        reopened, downloads = self.run_and_record_downloads(query_params=written)
+        self.assertEqual(self.controls(reopened), ("noise", 6.0, 0.005, 7))
+        self.assertEqual(self.link_notes(reopened), [])
+        self.assertEqual(downloads[LAB_DOWNLOAD_LABEL], self.expected_csv("noise", 6.0, 0.005, 7))
 
 
 class UncertainAndWholeFileTests(AppTestCase):
