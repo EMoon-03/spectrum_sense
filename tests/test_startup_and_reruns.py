@@ -13,6 +13,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import iq_csv
+import iq_formats
 from spectrum_sense import SAMPLES_PER_WINDOW, generate_capture
 
 
@@ -67,9 +68,11 @@ class UploadCacheTests(unittest.TestCase):
         self.addCleanup(st.cache_data.clear)
 
     def start_app(self, payload: bytes):
-        """Start the app with an upload and count calls to the CSV parser."""
-        uploader = patch("streamlit.file_uploader", return_value=BytesIO(payload))
-        parser = patch("iq_csv.from_csv", wraps=iq_csv.from_csv)
+        """Start the app with a CSV upload and count calls to the file loader."""
+        upload = BytesIO(payload)
+        upload.name = "recording.csv"
+        uploader = patch("streamlit.file_uploader", return_value=[upload])
+        parser = patch("iq_formats.load_uploads", wraps=iq_formats.load_uploads)
         uploader.start()
         self.addCleanup(uploader.stop)
         counted_parser = parser.start()

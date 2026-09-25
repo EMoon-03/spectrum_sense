@@ -13,7 +13,8 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, from_csv, to_csv
+from iq_csv import MAX_SAMPLES, MAX_UPLOAD_BYTES, format_size, to_csv
+from iq_formats import MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, Recording, load_uploads
 from signal_config import (
     CLASSES,
     FREQ_OFFSET_RANGE,
@@ -27,8 +28,8 @@ from spectrum_sense import extract_features, generate_capture, make_dataset
 st.set_page_config(page_title="SpectrumSense Signal Lab", page_icon="📡", layout="wide")
 
 # The browser-side check counts a megabyte as 1,000,000 bytes (1,048,576 on
-# Windows). Round up so the widget never rejects a file that from_csv accepts.
-UPLOAD_WIDGET_MB = math.ceil(MAX_UPLOAD_BYTES / 1_000_000)
+# Windows). Round up so the widget never rejects a file that a reader accepts.
+UPLOAD_WIDGET_MB = math.ceil(MAX_FILE_BYTES / 1_000_000)
 
 
 @st.cache_resource(show_spinner="Training the synthetic baseline…")
@@ -51,13 +52,32 @@ def get_demo_model():
 
 
 @st.cache_data(max_entries=2, show_spinner=False, scope="session")
-def parse_upload(data: bytes) -> np.ndarray:
-    """Parse an upload once per session, not on every widget change.
+def parse_upload(files: tuple[tuple[str, bytes], ...]) -> Recording:
+    """Parse (name, data) uploads once per session, not on every widget change.
 
     Streamlit does not cache raised errors, so an invalid file is rechecked and
     its ValueError reaches the caller on every run.
     """
-    return from_csv(data)
+    return load_uploads(files)
+
+
+SI_SCALES = ((1e9, "G", "billion"), (1e6, "M", "million"), (1e3, "k", "thousand"))
+
+
+def format_frequency(hertz: float) -> str:
+    """Readable frequency such as 433.92 MHz."""
+    for scale, prefix, _ in SI_SCALES:
+        if abs(hertz) >= scale:
+            return f"{hertz / scale:.6g} {prefix}Hz"
+    return f"{hertz:.6g} Hz"
+
+
+def format_sample_rate(rate: float) -> str:
+    """Readable rate such as 2.4 million samples per second."""
+    for scale, _, word in SI_SCALES:
+        if rate >= scale:
+            return f"{rate / scale:.6g} {word} samples per second"
+    return f"{rate:.6g} samples per second"
 
 
 def signal_plots(samples: np.ndarray, section: str) -> None:
@@ -126,7 +146,7 @@ st.warning(
     "Results on other signals or real recordings have not been validated."
 )
 
-lab_tab, upload_tab, about_tab = st.tabs(["Explore a signal", "Try an I/Q CSV", "How the model works"])
+lab_tab, upload_tab, about_tab = st.tabs(["Explore a signal", "Try your own recording", "How the model works"])
 
 with lab_tab:
     st.subheader("Create a simulated recording")
@@ -165,20 +185,49 @@ with lab_tab:
     )
 
 with upload_tab:
-    st.subheader("Explore your own I/Q sample file")
+    st.subheader("Explore your own I/Q recording")
     st.write(
-        f"Upload a UTF-8 CSV with headers `I,Q` and {SAMPLES_PER_WINDOW:,} to "
-        f"{MAX_SAMPLES:,} rows (at most {format_size(MAX_UPLOAD_BYTES)}). "
-        "You can try the file downloaded from the first tab. "
+        f"Upload a recording with {SAMPLES_PER_WINDOW:,} to {MAX_SAMPLES:,} I/Q samples: "
+        "a CSV, a raw SDR sample file, a NumPy array, or a SigMF recording. "
+        "You can try the CSV downloaded from the first tab. "
         f"Every {SAMPLES_PER_WINDOW:,} samples are displayed as a separate window."
     )
-    uploaded = st.file_uploader("Choose an I/Q CSV", type=["csv"], max_upload_size=UPLOAD_WIDGET_MB)
-    if uploaded is not None:
+    with st.expander("Supported file formats"):
+        st.markdown(
+            f"- **CSV:** UTF-8 text with the header `I,Q` and one sample per row "
+            f"(at most {format_size(MAX_UPLOAD_BYTES)}).\n"
+            "- **Raw SDR samples:** interleaved I and Q values, little-endian. "
+            "`.cf32`, `.fc32`, or `.cfile` hold 32-bit floats (GNU Radio file sink); "
+            "`.cs16` or `.sc16` hold 16-bit integers; `.cs8` holds 8-bit integers "
+            "(HackRF); `.cu8` holds unsigned 8-bit values (`rtl_sdr`). Integer "
+            "samples are scaled to about -1 to 1.\n"
+            "- **NumPy `.npy`:** a one-dimensional complex array, or a real array "
+            "with two columns (I and Q).\n"
+            "- **SigMF:** a `.sigmf` archive, or a `.sigmf-meta` file uploaded "
+            "together with its `.sigmf-data` file. Data types `cf32_le`, `ci16_le`, "
+            "`ci8`, and `cu8` are supported."
+        )
+    uploads = st.file_uploader(
+        "Choose a recording (or a .sigmf-meta and .sigmf-data pair)",
+        type=list(SUPPORTED_EXTENSIONS),
+        accept_multiple_files=True,
+        max_upload_size=UPLOAD_WIDGET_MB,
+    )
+    if uploads:
         try:
-            values = parse_upload(uploaded.getvalue())
+            loaded = parse_upload(tuple((upload.name, upload.getvalue()) for upload in uploads))
         except ValueError as exc:
             st.error(str(exc))
         else:
+            values = loaded.samples
+            details = [f"**Format:** {loaded.source_format}", f"**Samples:** {len(values):,}"]
+            if loaded.sample_rate is not None:
+                details.append(f"**Sample rate:** {format_sample_rate(loaded.sample_rate)}")
+            if loaded.center_frequency is not None:
+                details.append(
+                    f"**Center frequency:** {format_frequency(loaded.center_frequency)}"
+                )
+            st.markdown(" · ".join(details))
             available = len(values) // SAMPLES_PER_WINDOW
             if available > 1:
                 window_number = st.slider("Window to inspect", 1, available, 1)
@@ -188,8 +237,10 @@ with upload_tab:
             window = values[start : start + SAMPLES_PER_WINDOW]
             st.caption(f"Showing window {window_number} of {available} ({SAMPLES_PER_WINDOW} samples)")
             st.info(
-                "The prediction is exploratory. It assumes the toy model's symbol timing "
-                "and training conditions and cannot identify arbitrary real-world radio traffic."
+                "The prediction is exploratory. The demo model assumes its own synthetic "
+                f"timing of {SAMPLES_PER_SYMBOL} samples per symbol, and the file's sample "
+                "rate does not change what the model expects. It cannot identify arbitrary "
+                "real-world radio traffic."
             )
             try:
                 show_prediction(model, window, "uploaded")

@@ -27,11 +27,36 @@ The app has three tabs:
 - **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR, carrier offset,
   and random seed; inspect zoomable plots and the model scores. Download your
   example as a CSV.
-- **Try an I/Q CSV:** upload a UTF-8 CSV with columns `I,Q` and 1,024 to
-  100,000 numeric rows (at most 6 MB); inspect any complete 1,024-sample
+- **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
+  samples (see the formats below) and inspect any complete 1,024-sample
   window. The downloaded demo CSV works here as a first example.
 - **How the model works:** inspect its grouped test accuracy and learn what the
   synthetic score does and does not establish.
+
+### Supported upload formats
+
+| File | Contents |
+| --- | --- |
+| `.csv` | UTF-8 text with the header `I,Q` and one sample per row (at most 6 MB) |
+| `.cf32`, `.fc32`, `.cfile` | Raw complex float32, little-endian (GNU Radio file sink) |
+| `.cs16`, `.sc16` | Raw interleaved int16 I,Q, little-endian, scaled by 1/32768 |
+| `.cs8` | Raw interleaved int8 I,Q (HackRF), scaled by 1/128 |
+| `.cu8` | Raw interleaved uint8 I,Q (`rtl_sdr`), mapped by (x - 127.5) / 127.5 |
+| `.npy` | A 1-D complex array, or a real array with two columns (I, Q) |
+| `.sigmf` | An uncompressed SigMF archive holding one recording |
+| `.sigmf-meta` + `.sigmf-data` | The two files of one SigMF recording, uploaded together |
+
+SigMF recordings must be single-channel, with `core:datatype` `cf32_le`,
+`ci16_le`, `ci8`, or `cu8`. The app shows the SigMF sample rate and center
+frequency when the metadata includes them. Raw files carry no metadata. Either
+way, the demo model assumes its own synthetic timing of 8 samples per symbol,
+so a file's sample rate does not change what the model expects. Archives are
+read in memory and never extracted; links, special files, and unsafe paths are
+rejected. NumPy files are loaded without pickle support.
+
+Most SDR captures hold far more than 100,000 samples. Trim a raw file before
+uploading it; for example, `head -c 400000 capture.cs16 > short.cs16` keeps the
+first 100,000 samples of a 4-byte-per-sample `.cs16` file.
 
 CSV exports preserve the precision of the float64 I/Q components. These files
 are larger than rounded exports: 100,000 samples take about 4.2 MB for typical
@@ -49,8 +74,9 @@ With the dependencies installed, run:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The tests cover CSV validation and limits, lossless float64 interchange, and
-feature extraction and app uploads for extreme amplitudes.
+The tests cover CSV validation and limits, lossless float64 interchange, the
+raw SDR, NumPy, and SigMF readers, and feature extraction and app uploads for
+extreme amplitudes.
 
 ## Run the command-line baseline
 
