@@ -1,39 +1,96 @@
 # SpectrumSense: interactive signal lab
 
-This small, CPU-only project generates **simulated** complex I/Q samples for
-noise, BPSK, and QPSK. It plots representative signals, extracts a few
-explainable features, and trains a logistic-regression baseline. It is a
-learning exercise, not a validated RF receiver or an EW system.
+SpectrumSense simulates complex I/Q samples for noise, BPSK, and QPSK, extracts
+a few explainable features, and trains a logistic-regression baseline. A
+Streamlit app lets you explore simulated signals and try your own recordings.
+It is a small, CPU-only learning exercise on synthetic data, not a validated RF
+receiver or an EW system.
 
-## Open the interactive app
+## Quick start
 
-Download `SpectrumSense_Interactive.zip` to your computer and extract it first.
-In a terminal, change into the extracted `spectrum_sense` folder. Requires
-Python 3.10 or newer. On Linux, these commands work in fish or Bash without
-activating the virtual environment:
+You need Git and Python 3.10 or newer. The repository is private for now, so
+cloning it needs a GitHub account with access to it. On Linux or macOS, these
+commands work in Bash, zsh, or fish without activating the virtual environment:
 
 ```bash
+git clone https://github.com/EMoon-03/spectrum_sense.git
+cd spectrum_sense
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m streamlit run app.py
 ```
 
 Open the local address Streamlit prints (usually `http://localhost:8501`) in
-your browser. Press Ctrl+C in the terminal to stop the app. In VS Code you can
-open this folder and select `.venv/bin/python` as the Python interpreter.
+your browser. Press Ctrl+C in the terminal to stop the app. On Debian or
+Ubuntu, install the `python3-venv` package if creating the environment fails.
+
+On Windows, in PowerShell:
+
+```powershell
+git clone https://github.com/EMoon-03/spectrum_sense.git
+cd spectrum_sense
+py -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+If you prefer to activate the environment, use `source .venv/bin/activate`
+(Bash or zsh) or `source .venv/bin/activate.fish` (fish). In VS Code, open the
+folder and select the `.venv` Python as the interpreter.
+
+## Run it online (Streamlit Community Cloud)
+
+Streamlit Community Cloud can host the app from GitHub, so others can use it in
+a browser without installing anything. It deploys what is on GitHub, not what
+is on your computer, so push your commits to `main` first.
+
+1. Sign in at [share.streamlit.io](https://share.streamlit.io) with your GitHub
+   account, and authorize Streamlit when GitHub asks.
+2. Because the repository is private, also give Community Cloud access to your
+   private repositories (Streamlit's guide "Connect your GitHub account" shows
+   where), or make the repository public first. See the note below.
+3. Click **Create app**. When asked whether you already have an app, answer
+   that you do, since the app is already on GitHub.
+4. Fill in **Repository** `EMoon-03/spectrum_sense`, **Branch** `main`, and
+   **Main file path** `app.py`. You can also choose the app's address on
+   `streamlit.app` under **App URL**.
+5. Open **Advanced settings** and choose a Python version. Choose 3.12, one of
+   the two versions the automated tests run on. The app needs no secrets.
+   Click **Save**.
+6. Click **Deploy!** Community Cloud then installs `requirements.txt` and
+   starts the app; the first build can take a few minutes.
+7. Share the app's address. Later pushes to `main` update the running app.
+   Explore-tab links work there too: add, for example,
+   `?signal=QPSK&snr=3&offset=0.012&seed=7` to the app's address.
+
+**Private repositories.** When this was written (September 2026), Streamlit's
+documentation said that an app deployed from a private repository starts out
+private, visible only to you and people you invite, and that you can have only
+one private app at a time. Check the current Community Cloud documentation
+before relying on that, or make the repository public if the app should be open
+to everyone. Button names can also change; if the pages look different, follow
+the deployment guide at docs.streamlit.io.
+
+A hosted app runs on someone else's server: files uploaded in the app are sent
+to that server. Upload only recordings you are allowed to share.
+
+## What the app does
 
 The app has three tabs:
 
-- **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR, carrier offset,
-  and random seed; inspect zoomable plots and the model's answer and scores.
-  Download your example as a CSV. The page address holds the four settings,
-  for example `http://localhost:8501/?signal=QPSK&snr=3&offset=0.012&seed=7`,
-  so you can bookmark or share the exact example. A link's values are checked
-  when it opens: numbers outside a control's range or between its steps move
-  to the nearest allowed value, anything else falls back to the default, and a
-  short note lists what changed. Each change also adds a browser history
-  entry; going back changes the address but not the controls, so reload the
-  page to open an earlier address.
+- **Explore a signal:** choose noise, BPSK, or QPSK; adjust SNR (-12 to 20 dB),
+  carrier offset (-0.03 to 0.03 cycles per sample), and random seed; inspect
+  zoomable plots and the model's answer and scores. A note appears when the
+  offset, or the SNR of a BPSK or QPSK signal, is outside the model's training
+  range (-0.008 to 0.008 cycles per sample, and -2 to 14 dB). Download your
+  example as a CSV. The page address holds the four settings, for example
+  `http://localhost:8501/?signal=QPSK&snr=3&offset=0.012&seed=7`, so you can
+  bookmark or share the exact example. A link's values are checked when it
+  opens: numbers outside a control's range or between its steps move to the
+  nearest allowed value, anything else falls back to the default, and a short
+  note lists what changed. Each change also adds a browser history entry;
+  going back changes the address but not the controls, so reload the page to
+  open an earlier address.
 - **Try your own recording:** upload a recording with 1,024 to 100,000 I/Q
   samples (see the formats below). Every complete 1,024-sample window is
   classified: a timeline shows the answer for each window, a table counts the
@@ -52,6 +109,8 @@ The app has three tabs:
 - **How the model works:** inspect its grouped test accuracy, the limits behind
   the "uncertain" answer and how often it fires, and learn what the synthetic
   score does and does not establish.
+
+### Accessibility
 
 Each chart has a short text summary directly below it with the numbers it
 shows, such as the model scores, the RMS of I and Q, the strongest frequency
@@ -135,7 +194,11 @@ The tests cover CSV validation and limits, lossless float64 interchange, the
 raw SDR, NumPy, and SigMF readers, feature extraction and app uploads for
 extreme amplitudes, the "uncertain" answer and its probe signals, whole-file
 classification and its CSV, the spectrogram, the shareable Explore links, and
-the chart summaries and other accessibility features.
+the chart summaries and other accessibility features. The app tests run it
+headless with Streamlit's `AppTest`, so no browser is needed.
+
+GitHub Actions runs the same tests on Python 3.10 and 3.12 for every push and
+pull request; see `.github/workflows/tests.yml`.
 
 ## Run the command-line baseline
 
@@ -145,15 +208,16 @@ In the same folder:
 .venv/bin/python spectrum_sense.py
 ```
 
-If you prefer activating the environment in fish, use
-`source .venv/bin/activate.fish`. On Windows PowerShell, use
-`.venv\Scripts\python.exe` in place of `.venv/bin/python`.
+On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
 Look in `results/` for `example_signals.png`, `confusion_matrix.png`,
 `metrics.txt`, and `capture_manifest.csv`. To change the dataset size:
 
 ```bash
 .venv/bin/python spectrum_sense.py --captures-per-class 80 --windows-per-capture 4
 ```
+
+Add `--output-dir my_results` to write somewhere else and keep the example run
+in `results/` unchanged.
 
 ## What to inspect first
 
@@ -163,7 +227,7 @@ Look in `results/` for `example_signals.png`, `confusion_matrix.png`,
    column assigns a complete session to training or testing.
 3. Read `metrics.txt` and `confusion_matrix.png`. Find the least reliable class
    and the signal-to-noise ratio (SNR) range where predictions fail.
-4. In `spectrum_sense.py`, adjust `SNR_DB_RANGE` or `FREQ_OFFSET_RANGE`, rerun,
+4. In `signal_config.py`, adjust `SNR_DB_RANGE` or `FREQ_OFFSET_RANGE`, rerun,
    and record what changed. This is a small, defensible first experiment.
 
 The generator fixes total average power across examples, so the model cannot
@@ -177,8 +241,23 @@ idealized symbol timing and repeated symbols; it is **not** evidence of
 performance on real recordings. Report it as a synthetic baseline.
 
 The default run uses 60 captures per class, four windows per capture, and a
-fixed seed of 42. The `results/` folder in this starter archive contains one
-example run so you can compare its figures with your own output.
+fixed seed of 42. The `results/` folder in this repository contains one example
+run so you can compare its figures with your own output.
+
+## Project files
+
+| File | Contents |
+| --- | --- |
+| `app.py` | The Streamlit app |
+| `spectrum_sense.py` | Signal generator, features, training, the "uncertain" check, whole-file classification, and the command-line baseline |
+| `signal_config.py` | Shared settings: classes, window size, training ranges, and the "uncertain" limits |
+| `iq_csv.py` | CSV import and lossless export |
+| `iq_formats.py` | Readers for raw SDR, NumPy, and SigMF recordings |
+| `spectrogram.py` | The whole-recording spectrogram |
+| `summaries.py` | The text summaries under each chart |
+| `explore_url.py` | Reads, checks, and writes the Explore tab's settings in shareable links |
+| `tests/` | The regression tests |
+| `results/` | One example run of the command-line baseline |
 
 ## Next increments
 
