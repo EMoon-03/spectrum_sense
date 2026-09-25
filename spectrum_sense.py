@@ -10,10 +10,6 @@ import argparse
 import csv
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
@@ -144,6 +140,8 @@ def make_dataset(rng: np.random.Generator, captures_per_class: int, windows: int
 
 
 def plot_examples(windows: np.ndarray, labels: np.ndarray, output: Path) -> None:
+    import matplotlib.pyplot as plt  # Imported here so the app does not load matplotlib.
+
     fig, axes = plt.subplots(len(CLASSES), 3, figsize=(13, 9), constrained_layout=True)
     for row, label in enumerate(CLASSES):
         x = windows[np.flatnonzero(labels == label)[0]]
@@ -171,6 +169,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.captures_per_class < 10 or args.windows_per_capture < 2:
         parser.error("Use at least 10 captures per class and 2 windows per capture")
+
+    # The command line only writes image files, so it never needs a display.
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)

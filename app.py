@@ -46,6 +46,16 @@ def get_demo_model():
     return model, accuracy, len(set(groups[train_idx])), len(set(groups[test_idx]))
 
 
+@st.cache_data(max_entries=2, show_spinner=False, scope="session")
+def parse_upload(data: bytes) -> np.ndarray:
+    """Parse an upload once per session, not on every widget change.
+
+    Streamlit does not cache raised errors, so an invalid file is rechecked and
+    its ValueError reaches the caller on every run.
+    """
+    return from_csv(data)
+
+
 def signal_plots(samples: np.ndarray, section: str) -> None:
     """Hoverable, zoomable time, constellation, and frequency views."""
     time_axis = np.arange(128)
@@ -153,7 +163,7 @@ with upload_tab:
     uploaded = st.file_uploader("Choose an I/Q CSV", type=["csv"], max_upload_size=2)
     if uploaded is not None:
         try:
-            values = from_csv(uploaded.getvalue())
+            values = parse_upload(uploaded.getvalue())
         except ValueError as exc:
             st.error(str(exc))
         else:
