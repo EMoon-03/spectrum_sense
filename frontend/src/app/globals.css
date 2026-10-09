@@ -1,0 +1,130 @@
+@import "tailwindcss";
+
+/* SpectrumSense design tokens
+   ---------------------------
+   Reference point is the bench instrument and the lab notebook: a quiet,
+   cool page, figures that line up, charts that carry their own numbers in
+   text. Not a SaaS dashboard.
+
+   Chart colours are Okabe-Ito (blue #0072B2, vermillion #D55E00, orange
+   #E69F00), which stay distinct under the common colour-vision
+   deficiencies; I and Q also differ by line style, never by colour alone.
+   Decision tones: a trained class is blue, "uncertain" is orange, and "not
+   classifiable" is grey, so the three kinds of answer never share a hue. */
+
+:root {
+  --paper: #f4f6f8;
+  --surface: #ffffff;
+  --ink: #101b26;
+  --ink-muted: #4f6273;
+  --ink-faint: #7f8f9e;
+  --rule: #dde3e9;
+  --rule-strong: #c0cad4;
+
+  --signal: #0072b2; /* Okabe-Ito blue: I, scores, a named class */
+  --signal-soft: #e3eff8;
+  --quadrature: #d55e00; /* Okabe-Ito vermillion: Q */
+  --uncertain: #b26f00; /* Okabe-Ito orange, darkened for text contrast */
+  --uncertain-soft: #fcf1dc;
+  --plain: #6b7784; /* not classifiable, neutral */
+  --plain-soft: #eceff2;
+
+  --accent: #1d4e6f; /* links, focus, buttons */
+  --accent-soft: #e8eef3;
+
+  --flag: #9a6b12; /* outside-the-training-range notes */
+  --flag-soft: #fdf6e6;
+
+  --bad: #9e3b54;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-rule: var(--rule);
+  --color-rule-strong: var(--rule-strong);
+  --color-signal: var(--signal);
+  --color-signal-soft: var(--signal-soft);
+  --color-quadrature: var(--quadrature);
+  --color-uncertain: var(--uncertain);
+  --color-uncertain-soft: var(--uncertain-soft);
+  --color-plain: var(--plain);
+  --color-plain-soft: var(--plain-soft);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-flag: var(--flag);
+  --color-flag-soft: var(--flag-soft);
+  --color-bad: var(--bad);
+}
+
+html {
+  font-family:
+    "IBM Plex Sans", "Source Sans 3", "Segoe UI", system-ui, -apple-system,
+    sans-serif;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* Figures line up in columns and don't jitter when a slider moves. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+.serif {
+  font-family: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+/* Keyboard focus stays visible everywhere. */
+:where(a, button, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Native range inputs in the two chart colours, so the SNR and offset
+   sliders read as the controls of the instrument rather than a form. */
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Rendered Markdown from the API (credits and the recording description). */
+.prose-plain p + p {
+  margin-top: 0.75rem;
+}
+.prose-plain ul {
+  margin-top: 0.75rem;
+  padding-left: 1.25rem;
+  list-style: disc;
+}
+.prose-plain li + li {
+  margin-top: 0.375rem;
+}
+.prose-plain a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.prose-plain strong {
+  font-weight: 600;
+  color: var(--ink);
+}

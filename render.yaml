@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: spectrum-sense-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # /health reports "starting" until the demo model has trained, so Render
+    # waits for a working instance rather than routing to one that is not
+    # ready. Training takes a fraction of a second; the first cold start on
+    # the free plan is dominated by importing scikit-learn and SciPy.
+    healthCheckPath: /health
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+
+      # REQUIRED. The API rejects cross-origin requests from anywhere not
+      # listed here. Comma-separated, no trailing slash, scheme included:
+      #   https://spectrum-sense.vercel.app
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      # Optional; see backend/.env.example.
+      - key: RUN_CACHE_SIZE
+        value: "16"   # the free plan has 512 MB; a run holds up to 100,000 complex samples

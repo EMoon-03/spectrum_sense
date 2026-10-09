@@ -1,0 +1,12 @@
+# The DSP and model core, the API, and the Streamlit lab share one file so
+# that the regression tests (which exercise all three) install once.
+numpy>=2.0,<3
+scikit-learn>=1.5,<2
+scipy>=1.10,<2
+matplotlib>=3.8,<4
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+python-dotenv>=1.0,<2
+streamlit>=1.58,<2
+plotly>=5.24,<7
