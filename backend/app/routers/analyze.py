@@ -7,7 +7,9 @@
     GET  /runs/{id}/windows/n  one window's decision and plots
     GET  /runs/{id}/results.csv
 
-Errors: 413 when a body is larger than the limit, 422 for a file the readers
+Errors: 413 when a body is larger than the limit (app/uploads.py refuses one
+whose Content-Length is too large before reading it, and 411 one without a
+Content-Length), 422 for a file the readers
 reject or settings prepare.py rejects (the detail is the reader's own
 plain-language message, which never repeats text from the file), and 404 for
 a run this process no longer holds, which the client answers by analyzing
@@ -19,6 +21,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from prepare import PrepareSettings
 
@@ -54,7 +57,7 @@ def _analyze(files, settings: PrepareSettings, source: str) -> schemas.AnalyzeRe
     return analysis.to_response(demo, run)
 
 
-@router.post("/analyze", response_model=schemas.AnalyzeResponse, responses={413: {"model": schemas.ErrorOut}, 422: {"model": schemas.ErrorOut}})
+@router.post("/analyze", response_model=schemas.AnalyzeResponse, responses={411: {"model": schemas.ErrorOut}, 413: {"model": schemas.ErrorOut}, 422: {"model": schemas.ErrorOut}})
 async def analyze_upload(
     files: Annotated[list[UploadFile], File(description="One recording, or a .sigmf-meta and .sigmf-data pair")],
     offset: Annotated[float, Form()] = 0.0,
@@ -79,7 +82,9 @@ async def analyze_upload(
     settings = _settings(
         schemas.PrepareSettingsIn(offset=offset, bandwidth=bandwidth, symbol_rate=symbol_rate, factor=factor)
     )
-    return _analyze(tuple(loaded), settings, "upload")
+    # Reading the uploads needs the event loop; the analysis is CPU work, so it
+    # runs in a worker thread and other requests are answered meanwhile.
+    return await run_in_threadpool(_analyze, tuple(loaded), settings, "upload")
 
 
 @router.post("/analyze/example", response_model=schemas.AnalyzeResponse, responses={422: {"model": schemas.ErrorOut}})

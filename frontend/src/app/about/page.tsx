@@ -33,7 +33,17 @@ export default function AboutPage() {
         <section>
           <h2 className="serif text-xl">What the score does not establish</h2>
           <p className="mt-3 text-ink-muted">
-            Test accuracy reflects this generator and its impairment ranges. A very high score is expected from idealized timing and repeated symbols; it is not evidence of performance on real recordings. The bundled real recording (QPSK packets through an Intelsat 37e transponder, root-raised-cosine pulses at 4 samples per symbol) shows why: most of its windows mix a packet and a gap, their power jumps by 6 dB partway through, no training window does that, and the model rightly answers &ldquo;uncertain&rdquo;. Windows entirely inside a packet are mostly called QPSK, but close to the distance limit. Treat a QPSK answer on real data as a hint, not a confirmation.
+            Test accuracy reflects this generator and its impairment ranges. A very high score is expected from idealized timing and repeated symbols; it is not evidence of performance on real recordings. The bundled real recording (QPSK packets through an Intelsat 37e transponder, root-raised-cosine pulses at 4 samples per symbol) shows why: most of its windows mix a packet and a gap, their power jumps by 6 dB partway through, no training window does that, and the model rightly answers &ldquo;uncertain&rdquo;. Windows entirely inside a packet are answered &ldquo;uncertain&rdquo; too: their fourth-power line, the clearest sign of QPSK, is about half as strong as the model&rsquo;s own QPSK would show, because the pulses are smoothly shaped. Treat any answer on real data as a hint, not a confirmation.
+          </p>
+        </section>
+
+        <section>
+          <h2 className="serif text-xl">Why this answer</h2>
+          <p className="mt-3 text-ink-muted">
+            Every decision carries its evidence. The squared distance to the nearest trained class is split exactly among the eight features: the offset from the class&rsquo;s mean is whitened with the symmetric square root of its inverse covariance, which keeps each component as close as possible to its own feature, and the squared components add up to the squared distance. A share says where the distance lies, not what caused it; a feature with an ordinary value can hold a large share when it disagrees with the others. So each feature also gets the value the class&rsquo;s fit expects given the other seven, and the distance the window would have if only that feature took it: &ldquo;changing the fourth-power line alone would bring the window inside the limit&rdquo; is a statement you can check. For the scores, each feature&rsquo;s contribution to the log-odds of the leading class over the runner-up is exact, because the classifier is linear in the standardized features.
+          </p>
+          <p className="mt-3 text-ink-muted">
+            For an &ldquo;uncertain&rdquo; window, three direct measurements name properties no training window has: the power changing within the window (a burst and a gap), a bare carrier, and a steady component at 0 Hz. Each states the number it measured and the margin its limit was chosen with on simulated windows. None changes a decision or names a modulation, and when none fires the page says so rather than guess.
           </p>
         </section>
 
@@ -54,7 +64,7 @@ export default function AboutPage() {
         <section>
           <h2 className="serif text-xl">Architecture</h2>
           <p className="mt-3 text-ink-muted">
-            A FastAPI backend holds the DSP, the model, and an in-memory cache of analyzed runs; this Next.js frontend is one client of it, and the original Streamlit lab is another. The TypeScript types are generated from the API&rsquo;s OpenAPI document, so the two cannot disagree about a field. Every result carries a fingerprint of the model that produced it.
+            A FastAPI backend holds the DSP, the model, and an in-memory cache of analyzed runs; this Next.js frontend is one client of it, and the original Streamlit lab is another. The TypeScript types are generated from the API&rsquo;s OpenAPI document, so the two cannot disagree about a field. Every result carries a fingerprint of the model that produced it: a hash of the training settings, the source of every function that generates, measures, trains, or decides, and the versions of Python and the numerical libraries, with a test that fails if a new function escapes it.
           </p>
           <p className="mt-3 text-ink-muted">
             The numbers on the <Link href="/model" className="text-accent underline underline-offset-4">Model</Link> page are regression-tested: the repository&rsquo;s test suite repeats the measurements and fails if they drift.

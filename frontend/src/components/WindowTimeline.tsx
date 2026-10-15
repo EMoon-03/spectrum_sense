@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import type { WindowDecision } from "@/lib/api";
 import {
   NOT_CLASSIFIABLE,
@@ -44,6 +44,10 @@ function Marker({ shape, x, y, color, selected }: { shape: string; x: number; y:
  * The decision for every window: window number across, one row per
  * decision down. Rows differ by position and marker shape as well as
  * colour. Click a window to select it.
+ *
+ * The chart is a group, not an image, so its window buttons stay reachable
+ * by screen readers; the caption names it and the summary describes it, and
+ * the axis labels are hidden as each button names its own window.
  */
 export default function WindowTimeline({
   windows,
@@ -59,6 +63,8 @@ export default function WindowTimeline({
   summary: string;
 }) {
   const [hover, setHover] = useState<WindowDecision | null>(null);
+  const captionId = useId();
+  const summaryId = useId();
   const rows = [...classes, UNCERTAIN];
   if (windows.some((w) => w.label === NOT_CLASSIFIABLE)) rows.push(NOT_CLASSIFIABLE);
   const height = TOP + rows.length * ROW + BOTTOM;
@@ -70,7 +76,7 @@ export default function WindowTimeline({
 
   return (
     <figure className="border border-rule bg-surface">
-      <figcaption className="px-5 pt-4 text-sm text-ink-muted">
+      <figcaption id={captionId} className="px-5 pt-4 text-sm text-ink-muted">
         Decision for each window (window number across)
       </figcaption>
       <div className="overflow-x-auto px-2 pt-2">
@@ -78,11 +84,12 @@ export default function WindowTimeline({
           viewBox={`0 0 ${width} ${height}`}
           width="100%"
           style={{ minWidth: 560, display: "block" }}
-          role="img"
-          aria-label={summary}
+          role="group"
+          aria-labelledby={captionId}
+          aria-describedby={summaryId}
         >
           {rows.map((label) => (
-            <g key={label}>
+            <g key={label} aria-hidden="true">
               <line x1={LEFT} x2={width - RIGHT} y1={y(label)} y2={y(label)} stroke="#eef1f4" />
               <text x={LEFT - 8} y={y(label)} textAnchor="end" dominantBaseline="middle" fontSize={12} fill="#4f6273">
                 {label}
@@ -91,7 +98,7 @@ export default function WindowTimeline({
           ))}
           {windows.map((w) =>
             (w.number === 1 || w.number % tickEvery === 0) ? (
-              <text key={`t${w.number}`} x={x(w.number)} y={height - 8} textAnchor="middle" fontSize={11} fill="#7f8f9e">
+              <text key={`t${w.number}`} x={x(w.number)} y={height - 8} textAnchor="middle" fontSize={11} fill="#7f8f9e" aria-hidden="true">
                 {w.number}
               </text>
             ) : null,
@@ -107,7 +114,9 @@ export default function WindowTimeline({
               role="button"
               aria-label={`Window ${w.number}: ${w.label}`}
               onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") onSelect(w.number);
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault(); // Space would otherwise scroll the page
+                onSelect(w.number);
               }}
             >
               <rect x={x(w.number) - 6} y={TOP} width={12} height={rows.length * ROW} fill="transparent" />
@@ -127,7 +136,7 @@ export default function WindowTimeline({
           ? `Window ${hover.number}: ${hover.label}${hover.reason ? ` (${hover.reason})` : ""}, distance ${formatDistance(hover.distance)}, top score ${formatScore(hover.top_score)}`
           : "Hover a marker for its scores; click to open the window below."}
       </p>
-      <p className="border-t border-rule px-5 py-3 text-sm leading-relaxed text-ink">
+      <p id={summaryId} className="border-t border-rule px-5 py-3 text-sm leading-relaxed text-ink">
         {summary}
       </p>
     </figure>

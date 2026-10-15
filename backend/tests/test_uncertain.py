@@ -326,8 +326,8 @@ class DemoModelTests(unittest.TestCase):
             demo.false_reject_rate,
         )
         self.assertEqual(groups[-1].group, "Noise (no SNR)")
-        # The About tab says uncertain answers and errors are most common near
-        # the bottom of the training range.
+        # The About tab says uncertain answers are most common near the bottom
+        # of the training range, and so are errors when there are any.
         signal = groups[:-1]
         self.assertTrue(signal[0].group.startswith(f"BPSK and QPSK at {SNR_DB_RANGE[0]:g} to"))
         self.assertEqual(signal[0].false_reject_rate, max(r.false_reject_rate for r in signal))
@@ -378,11 +378,14 @@ class SnrBehaviourTests(unittest.TestCase):
                 self.assertGreaterEqual(self.share("tone", snr), 0.95)
                 if snr >= 4:
                     self.assertGreater(self.share("16-QAM", snr), 0.5)
-        for snr in (0, 2, 4, 6):
+        # 8PSK slips through as QPSK at 0 and 2 dB, and is flagged from 4 dB up.
+        # (With the earlier squared and fourth-power features, which averaged
+        # their spectral lines away, it was flagged only from about 12 dB.)
+        for snr in (0, 2):
             with self.subTest(kind="8PSK", snr=snr):
                 self.assertLessEqual(self.share("8PSK", snr), 0.1)
-        self.assertTrue(0.4 <= self.share("8PSK", 10) <= 0.8)  # "Roughly 60%".
-        for snr in (12, 14):
+                self.assertGreaterEqual(self.share("8PSK", snr, "QPSK"), 0.9)
+        for snr in range(4, 15, 2):
             with self.subTest(kind="8PSK", snr=snr):
                 self.assertGreaterEqual(self.share("8PSK", snr), 0.95)
 
@@ -396,9 +399,11 @@ class SnrBehaviourTests(unittest.TestCase):
                     self.assertGreater(self.share(kind, -12, "noise"), 0.7)
 
     def test_known_signals_above_the_training_range_are_often_flagged(self):
-        for kind in ("BPSK", "QPSK"):
-            with self.subTest(kind=kind):
-                self.assertGreater(self.share(kind, 20), 0.5)
+        # QPSK at 20 dB always is; BPSK, whose features change less above
+        # 14 dB, about a third of the time. Neither is ever given the other's name.
+        self.assertGreaterEqual(self.share("QPSK", 20), 0.95)
+        self.assertTrue(0.2 <= self.share("BPSK", 20) <= 0.5, self.share("BPSK", 20))
+        self.assertEqual(self.share("BPSK", 20, "QPSK") + self.share("QPSK", 20, "BPSK"), 0)
 
     def test_bpsk_at_the_bottom_of_the_range_in_the_explore_tab(self):
         # The Explore tab makes one window from the seed, with no carrier offset
@@ -412,8 +417,8 @@ class SnrBehaviourTests(unittest.TestCase):
             _, (decision,) = classify_features(self.model, extract_features(capture[0]))
             answers.append(decision.label)
         uncertain = answers.count(UNCERTAIN) / len(answers)
-        self.assertTrue(0.6 <= uncertain <= 0.9, uncertain)  # "About three in four".
-        self.assertGreater(answers.count("QPSK"), 0)  # "Some of the rest are called QPSK".
+        self.assertGreaterEqual(uncertain, 0.9)  # "Nearly all".
+        self.assertLessEqual(answers.count("QPSK"), 2)  # "Almost never called QPSK".
 
 
 class ClassifyRecordingTests(unittest.TestCase):

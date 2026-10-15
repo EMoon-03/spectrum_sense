@@ -13,7 +13,7 @@ import math
 
 import numpy as np
 
-from signal_config import REASON_UNFAMILIAR, UNCERTAIN
+from signal_config import FEATURE_NAMES, REASON_UNFAMILIAR, UNCERTAIN
 from spectrogram import FLOOR_DB, Spectrogram
 
 
@@ -28,6 +28,8 @@ STEADY_LEVEL_DB = 3.0
 # A time step has a clear peak when its strongest bin is at least this many dB
 # above the step's median bin. Noise alone rarely reaches it.
 CLEAR_PEAK_DB = 12.0
+# The evidence summary names at most this many features.
+EVIDENCE_FEATURES = 3
 # The strongest frequency counts as moving when it changes by more than this
 # share of the band. BPSK and QPSK spread over about a quarter of the band, so
 # their strongest bin wanders by less than this from one time step to the next.
@@ -426,6 +428,60 @@ def decision_summary(decision, distance_threshold: float, min_top_score: float) 
     return (
         f"Uncertain because {why}. The leading candidate is {decision.leading} "
         f"with a score of {score}."
+    )
+
+
+def _join(items: Sequence[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def evidence_summary(
+    evidence, distance_threshold: float, names: Sequence[str] = FEATURE_NAMES
+) -> str:
+    """Explain a spectrum_sense.FeatureEvidence in two sentences.
+
+    The first names the features that hold most of the distance to the
+    nearest class, by share, until they hold at least half of it (at most
+    EVIDENCE_FEATURES). For a window beyond the distance limit, the second
+    names the one feature whose change would shorten the distance most, the
+    value the class's fit expects for it, and whether that change alone would
+    bring the window inside the limit; otherwise it names the feature that
+    does most to put the leading class ahead of the runner-up. The wording
+    says where the distance lies, never what caused it.
+    """
+    shares = np.asarray(evidence.distance_shares, dtype=float)
+    if not shares.any():
+        where = f"The window sits exactly on the typical {evidence.nearest} window."
+    else:
+        listed, held = [], 0.0
+        for index in np.argsort(shares)[::-1][:EVIDENCE_FEATURES]:
+            listed.append(f"the {names[index]} ({shares[index]:.0%})")
+            held += shares[index]
+            if held >= 0.5:
+                break
+        amount = "Most" if held >= 0.5 else "The largest parts"
+        where = (
+            f"{amount} of the distance to {evidence.nearest}, the nearest trained class, "
+            f"lies in {_join(listed)}."
+        )
+    if evidence.distance > distance_threshold:
+        index = int(np.argmin(evidence.distance_if_expected))
+        after, limit = format_against_limit(evidence.distance_if_expected[index], distance_threshold)
+        before = f"{evidence.distance:.2f}"
+        verdict = "inside" if evidence.distance_if_expected[index] <= distance_threshold else "still beyond"
+        return (
+            f"{where} Given the window's other features, the {evidence.nearest} fit expects "
+            f"about {evidence.expected[index]:.2f} for the {names[index]}, not "
+            f"{evidence.values[index]:.2f}; changing that alone would take the distance from "
+            f"{before} to {after}, {verdict} the limit of {limit}."
+        )
+    push = np.asarray(evidence.score_push, dtype=float)
+    strongest = int(np.argmax(push))
+    if push[strongest] <= 0:
+        return where
+    return (
+        f"{where} The {names[strongest]} does most to put {evidence.leading} ahead of "
+        f"{evidence.runner_up} in the scores."
     )
 
 

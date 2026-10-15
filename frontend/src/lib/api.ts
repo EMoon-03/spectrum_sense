@@ -17,6 +17,24 @@ import type { components } from "./api.generated";
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Whether the API runs on this machine. Then an unreachable API means the
+ *  backend isn't started; a deployed one is more likely asleep. */
+export const API_IS_LOCAL = (() => {
+  try {
+    const host = new URL(API_BASE).hostname;
+    return ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(host);
+  } catch {
+    return false;
+  }
+})();
+
+/** How long a server-rendered page waits for the API. Render's free plan
+ *  can hold a request for most of a minute while it wakes; past this the
+ *  page renders its "unavailable" state and the browser waits instead.
+ *  Requests from the browser have no limit: an upload can be slow, and the
+ *  reader can see that it is in progress. */
+const SERVER_TIMEOUT_MS = 8000;
+
 type S = components["schemas"];
 
 export type HealthOut = S["HealthOut"];
@@ -42,6 +60,17 @@ export class ApiError extends Error {
   }
 }
 
+/** The API gave no answer: refused, unresolvable, or slower than the
+ *  server-side limit. */
+export class ApiUnreachable extends Error {}
+
+/** Whether an error means the API is down, asleep, or still starting, as
+ *  opposed to an answer it gave. Pages show ApiUnavailable for these. */
+export function isUnavailable(e: unknown): boolean {
+  if (e instanceof ApiError) return e.status === 502 || e.status === 503 || e.status === 504;
+  return e instanceof ApiUnreachable;
+}
+
 /** Message for an error the user can act on, by where it came from. */
 export function describeError(e: unknown): string {
   if (e instanceof ApiError) {
@@ -52,7 +81,9 @@ export function describeError(e: unknown): string {
       return "The API is still starting. Wait a moment and try again.";
     return `The API answered ${e.status}: ${e.message}`;
   }
-  return "Can't reach the SpectrumSense API. Make sure the backend is running on port 8000.";
+  if (API_IS_LOCAL)
+    return "Can't reach the SpectrumSense API. Make sure the backend is running on port 8000.";
+  return "Can't reach the SpectrumSense API. It runs on a free server that sleeps when idle, and waking it can take up to about a minute. Try again shortly.";
 }
 
 async function fail(res: Response): Promise<never> {
@@ -66,21 +97,39 @@ async function fail(res: Response): Promise<never> {
   throw new ApiError(detail || "Request failed", res.status);
 }
 
+/** On the server, add the timeout to any signal the caller passed. */
+function limited(init: RequestInit): RequestInit {
+  if (typeof window !== "undefined") return init;
+  const timeout = AbortSignal.timeout(SERVER_TIMEOUT_MS);
+  return { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout };
+}
+
+/** Fetch and parse one response. A refused connection (fetch's TypeError)
+ *  and the server-side timeout both become ApiUnreachable, so a page has
+ *  one "unavailable" path; an abort the caller asked for is rethrown. */
+async function request<T>(path: string, init: RequestInit): Promise<T> {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, limited(init));
+    if (!res.ok) return await fail(res);
+    return await res.json();
+  } catch (e) {
+    const timedOut = e instanceof DOMException && e.name === "TimeoutError";
+    if (timedOut || e instanceof TypeError) throw new ApiUnreachable(String(e), { cause: e });
+    throw e;
+  }
+}
+
 async function get<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store", ...init });
-  if (!res.ok) return fail(res);
-  return res.json();
+  return request<T>(path, { cache: "no-store", ...init });
 }
 
 async function postJson<T>(path: string, payload: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return request<T>(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     cache: "no-store",
   });
-  if (!res.ok) return fail(res);
-  return res.json();
 }
 
 // --- health and model ------------------------------------------------------
@@ -142,9 +191,7 @@ export async function analyzeUpload(
   form.append("bandwidth", String(settings.bandwidth));
   form.append("symbol_rate", String(settings.symbol_rate));
   form.append("factor", String(settings.factor));
-  const res = await fetch(`${API_BASE}/analyze`, { method: "POST", body: form });
-  if (!res.ok) return fail(res);
-  return res.json();
+  return request<AnalyzeResponse>("/analyze", { method: "POST", body: form });
 }
 
 export function analyzeExample(settings: PrepareSettings): Promise<AnalyzeResponse> {

@@ -62,13 +62,15 @@ ABOUT = (
     "- **The gaps:** the noise between packets is spread fairly evenly across the "
     "recorded band, much like the model's training noise. But every gap is shorter "
     f"than a {SAMPLES_PER_WINDOW:,}-sample window, so no window here holds gap alone.\n"
-    '- **Why so many windows are "uncertain":** most windows hold part of a gap and '
-    "part of a packet, so their power jumps by about 6 dB partway through. No training "
+    '- **Why every window is "uncertain":** most windows hold part of a gap and part '
+    "of a packet, so their power jumps by about 6 dB partway through. No training "
     'window does that, so the model answers "uncertain" because the window is unlike '
-    "the training data. Windows that lie entirely inside a packet are mostly called "
-    "QPSK, but they come close to the distance limit, so some are answered uncertain "
-    "too. The model has seen only simulated signals: treat a QPSK answer as a hint, "
-    "not a confirmation.\n"
+    "the training data. Windows that lie entirely inside a packet are answered "
+    '"uncertain" too: their fourth-power line, the clearest sign of QPSK, is about '
+    "half as strong as the model's own QPSK would show, because smoothly shaped pulses "
+    "spend much of each symbol between the four phases. Choose a window to see this "
+    "under \"Why this answer\". The model has seen only rectangular pulses, and says "
+    "so rather than guess.\n"
     '- **Preparing it does not help:** under "Prepare the recording (optional)", a '
     f"symbol rate of 125 resamples the excerpt to {SAMPLES_PER_SYMBOL} samples per symbol "
     'and 60 windows, and every one of them is answered "uncertain" because it is unlike '

@@ -22,6 +22,11 @@ schemas rather than by the page:
 - Every decision travels with its reason and the two limits it was checked
   against (the distance to the nearest trained class and the minimum top
   score), so a client can render "uncertain" without re-deriving thresholds.
+- Every decision also carries its evidence (spectrum_sense.explain_features):
+  where the distance to the nearest class lies, feature by feature, the value
+  each feature would need to fit the others, and what pushed the scores; and,
+  for an "uncertain" window, the measured possible causes (causes.py).
+  Neither changes a decision.
 - Whether an Explore setting lies inside the model's training range is a
   field of the response, not a note a page may forget to show.
 - Every result carries the model fingerprint (app.model.MODEL_VERSION). The
@@ -29,8 +34,9 @@ schemas rather than by the page:
   to the features or the training settings silently changes every answer;
   the fingerprint is what makes two per-window CSVs comparable.
 - Uploaded samples are held in memory only for the duration of a run cache
-  entry and are never written to disk. Error messages never repeat text from
-  an uploaded file.
+  entry and are never written to disk (app/uploads.py keeps the form parser
+  from spooling them to a temporary file). Error messages never repeat text
+  from an uploaded file.
 
 Routers are thin: all logic lives in the top-level modules (spectrum_sense,
 prepare, iq_formats, spectrogram, summaries, explore_url, real_example),

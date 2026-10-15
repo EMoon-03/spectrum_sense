@@ -3,17 +3,28 @@
 The model is trained once per process from a fixed seed (a fraction of a
 second) and never from user data. MODEL_VERSION hashes everything that
 determines its answers: the training settings, the shared signal settings,
-and the source of the feature, training, and decision code. A fingerprint
-that changes when any of those change is what lets a client, or a saved
-per-window CSV, say which model produced a result.
+the source of every spectrum_sense function and class that generates,
+measures, trains, or decides (FINGERPRINTED), and the versions of Python and
+of the numerical libraries. A fingerprint that changes when any of those
+change is what lets a client, or a saved per-window CSV, say which model
+produced a result.
+
+tests/test_model_version.py fails when spectrum_sense gains a function that
+is in neither FINGERPRINTED nor NOT_FINGERPRINTED, so a new piece of decision
+code cannot silently escape the fingerprint.
 """
 
 from __future__ import annotations
 
 import hashlib
 import inspect
+import platform
 from functools import lru_cache
 from pathlib import Path
+
+import numpy
+import scipy
+import sklearn
 
 import spectrum_sense
 import signal_config
@@ -23,6 +34,54 @@ from . import config
 
 _ROOT = Path(__file__).resolve().parents[1]
 
+# Everything in spectrum_sense that changes an answer, or a number /model
+# reports about the model.
+FINGERPRINTED = (
+    spectrum_sense.complex_gaussian,
+    spectrum_sense.generate_capture,
+    spectrum_sense._transmit,
+    spectrum_sense.generate_probe_capture,
+    spectrum_sense.line_strength,
+    spectrum_sense.extract_features,
+    spectrum_sense.make_dataset,
+    spectrum_sense.NoveltyModel,
+    spectrum_sense.fit_novelty,
+    spectrum_sense.novelty_distance,
+    spectrum_sense.Decision,
+    spectrum_sense.decide,
+    spectrum_sense.SignalClassifier,
+    spectrum_sense.classify_features,
+    spectrum_sense.FeatureEvidence,
+    spectrum_sense.explain_features,
+    spectrum_sense.train_classifier,
+    spectrum_sense.uncertain_rates,
+    spectrum_sense.probe_flag_rates,
+    spectrum_sense.GroupRates,
+    spectrum_sense.rates_by_snr,
+    spectrum_sense.DemoModel,
+    spectrum_sense.build_demo_model,
+    spectrum_sense.FileClassification,
+    spectrum_sense.classify_recording,
+)
+
+# The rest of spectrum_sense, and why leaving it out cannot change an answer.
+NOT_FINGERPRINTED = {
+    "_display_classes": "orders classes for display only",
+    "decision_order": "orders decisions for display only",
+    "decision_counts": "counts decisions that are already made",
+    "results_csv": "formats decisions that are already made",
+    "plot_examples": "command-line figures only",
+    "main": "the command-line baseline, not the app's model",
+}
+
+
+def _library_versions() -> str:
+    python = ".".join(platform.python_version_tuple()[:2])
+    return (
+        f"python={python} numpy={numpy.__version__} "
+        f"scipy={scipy.__version__} scikit-learn={sklearn.__version__}"
+    )
+
 
 def _fingerprint() -> str:
     digest = hashlib.sha256()
@@ -30,13 +89,9 @@ def _fingerprint() -> str:
         f"seed={config.MODEL_SEED}",
         f"captures={config.CAPTURES_PER_CLASS}",
         f"windows={config.WINDOWS_PER_CAPTURE}",
+        _library_versions(),
         (_ROOT / "signal_config.py").read_bytes(),
-        inspect.getsource(spectrum_sense.extract_features).encode(),
-        inspect.getsource(spectrum_sense.train_classifier).encode(),
-        inspect.getsource(spectrum_sense.decide).encode(),
-        inspect.getsource(spectrum_sense.fit_novelty).encode(),
-        inspect.getsource(spectrum_sense.generate_capture).encode(),
-        inspect.getsource(spectrum_sense._transmit).encode(),
+        *(inspect.getsource(item).encode() for item in FINGERPRINTED),
     ):
         data = part if isinstance(part, bytes) else part.encode()
         digest.update(len(data).to_bytes(8, "little"))
