@@ -9,7 +9,7 @@ own SDR recording, and read what the model measured about itself.
 It is a small, CPU-only learning exercise on synthetic data, not a validated
 RF receiver or an EW system.
 
-**3 classes · 1,024-sample windows · 413 tests · one real recording (CC BY 4.0)**
+**3 classes · 1,024-sample windows · 414 tests · one real recording (CC BY 4.0)**
 
 ---
 
@@ -289,7 +289,7 @@ backend/
 ├── streamlit_app.py         the Streamlit lab
 ├── tools/                   fetch and evaluate real recordings; dump the OpenAPI document
 ├── examples/                the bundled recording and its attribution
-└── tests/                   413 tests
+└── tests/                   414 tests
 frontend/
 └── src/
     ├── app/                 /, /explore, /analyze, /model, /about
@@ -362,7 +362,7 @@ for a forgotten run. The full document is at `/docs`.
 
 ## Testing
 
-**413 tests**, all offline, run on Python 3.10 and 3.12 by GitHub Actions
+**414 tests**, all offline, run on Python 3.10 and 3.12 by GitHub Actions
 alongside the frontend's lint and type-checked build and the check that the
 committed API types match the backend.
 

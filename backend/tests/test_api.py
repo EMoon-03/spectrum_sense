@@ -85,6 +85,15 @@ class HealthTests(ApiTestCase):
         ):
             self.assertIn(path, paths)
 
+    def test_openapi_document_does_not_depend_on_the_python_version(self):
+        # Python 3.13 renamed these status phrases; CI regenerates the
+        # frontend's types on another Python than a developer may use, and
+        # fails if the documents differ.
+        text = self.client.get("/openapi.json").text
+        for phrase in ("Unprocessable Entity", "Unprocessable Content",
+                       "Request Entity Too Large", "Content Too Large"):
+            self.assertNotIn(phrase, text)
+
     def test_cors_allows_only_the_configured_origins(self):
         allowed = config.ALLOWED_ORIGINS[0]
         yes = self.client.get("/health", headers={"Origin": allowed})

@@ -998,7 +998,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Length Required */
+            /** @description The upload has no Content-Length header */
             411: {
                 headers: {
                     [name: string]: unknown;
@@ -1007,7 +1007,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorOut"];
                 };
             };
-            /** @description Content Too Large */
+            /** @description The upload is larger than the limit */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -1016,7 +1016,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorOut"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -1049,7 +1049,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -1080,7 +1080,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1124,7 +1124,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1133,7 +1133,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorOut"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -1165,7 +1165,7 @@ export interface operations {
                     "application/json": components["schemas"]["WindowView"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1205,7 +1205,7 @@ export interface operations {
                     "text/csv": unknown;
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
