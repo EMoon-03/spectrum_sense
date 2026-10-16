@@ -310,6 +310,13 @@ export interface components {
             ignored_samples: number;
             /** Timeline Summary */
             timeline_summary: string;
+            /**
+             * Cause Counts
+             * @description Every cause, counted among uncertain windows
+             */
+            cause_counts: components["schemas"]["CauseCount"][];
+            /** Causes Summary */
+            causes_summary: string;
             /** Distance Threshold */
             distance_threshold: number;
             /** Min Top Score */
@@ -345,6 +352,33 @@ export interface components {
              * @default 1
              */
             factor: number;
+        };
+        /** CauseCount */
+        CauseCount: {
+            /** Key */
+            key: string;
+            /** Title */
+            title: string;
+            /**
+             * Count
+             * @description Uncertain windows that show this cause
+             */
+            count: number;
+        };
+        /**
+         * CauseOut
+         * @description Something measured in the window that no training window shows.
+         */
+        CauseOut: {
+            /**
+             * Key
+             * @enum {string}
+             */
+            key: "power-step" | "bare-carrier" | "center-component";
+            /** Title */
+            title: string;
+            /** Detail */
+            detail: string;
         };
         /**
          * Decision
@@ -384,6 +418,12 @@ export interface components {
             summary: string;
             /** Scores Summary */
             scores_summary: string;
+            evidence?: components["schemas"]["EvidenceOut"] | null;
+            /**
+             * Causes
+             * @description Measured properties no training window has; possible causes of an uncertain answer
+             */
+            causes?: components["schemas"]["CauseOut"][];
         };
         /** DecisionCount */
         DecisionCount: {
@@ -396,6 +436,31 @@ export interface components {
         ErrorOut: {
             /** Detail */
             detail: string;
+        };
+        /**
+         * EvidenceOut
+         * @description Where a window's features lie: the distance shares say where the
+         *     distance to the nearest class lies, not what caused it.
+         */
+        EvidenceOut: {
+            /**
+             * Nearest Class
+             * @description The trained class the distance is measured to
+             */
+            nearest_class: string;
+            /** Distance */
+            distance: number;
+            /** Leading */
+            leading: string;
+            /** Runner Up */
+            runner_up: string;
+            /**
+             * Features
+             * @description In extract_features order
+             */
+            features: components["schemas"]["FeatureEvidenceOut"][];
+            /** Summary */
+            summary: string;
         };
         /** ExampleInfo */
         ExampleInfo: {
@@ -462,6 +527,35 @@ export interface components {
             offset: number;
             /** Seed */
             seed: number;
+        };
+        /** FeatureEvidenceOut */
+        FeatureEvidenceOut: {
+            /** Name */
+            name: string;
+            /** Description */
+            description: string;
+            /** Value */
+            value: number;
+            /**
+             * Expected
+             * @description The value the nearest class's fit expects, given the window's other features
+             */
+            expected: number;
+            /**
+             * Distance Share
+             * @description Share of the squared distance to the nearest class, 0 to 1; shares sum to 1
+             */
+            distance_share: number;
+            /**
+             * Distance If Expected
+             * @description The distance to the nearest class if only this feature took the expected value
+             */
+            distance_if_expected: number;
+            /**
+             * Score Push
+             * @description Log-odds this feature adds for the leading class over the runner-up
+             */
+            score_push: number;
         };
         /** GroupRatesOut */
         GroupRatesOut: {
@@ -792,6 +886,11 @@ export interface components {
             top_score?: number | null;
             /** Scores */
             scores: (number | null)[];
+            /**
+             * Causes
+             * @description Keys of the window's CauseOut list
+             */
+            causes?: string[];
         };
         /** WindowView */
         WindowView: {
@@ -899,7 +998,16 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Content Too Large */
+            /** @description The upload has no Content-Length header */
+            411: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorOut"];
+                };
+            };
+            /** @description The upload is larger than the limit */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -908,7 +1016,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorOut"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -941,7 +1049,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -972,7 +1080,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1016,7 +1124,7 @@ export interface operations {
                     "application/json": components["schemas"]["AnalyzeResponse"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1025,7 +1133,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorOut"];
                 };
             };
-            /** @description Unprocessable Content */
+            /** @description A file or setting the readers reject, in their own words */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -1057,7 +1165,7 @@ export interface operations {
                     "application/json": components["schemas"]["WindowView"];
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1097,7 +1205,7 @@ export interface operations {
                     "text/csv": unknown;
                 };
             };
-            /** @description Not Found */
+            /** @description The run, or that window of it, is not available */
             404: {
                 headers: {
                     [name: string]: unknown;

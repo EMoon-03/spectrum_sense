@@ -1,10 +1,13 @@
 import Link from "next/link";
+import ApiUnavailable from "@/components/ApiUnavailable";
 import DecisionBadge from "@/components/DecisionBadge";
+import EvidenceCard from "@/components/EvidenceCard";
 import ExploreControls from "@/components/ExploreControls";
 import Notice from "@/components/Notice";
+import PossibleCauses from "@/components/PossibleCauses";
 import ScoreBars from "@/components/ScoreBars";
 import SignalPlots from "@/components/SignalPlots";
-import { explore, exploreCsvUrl, getModel } from "@/lib/api";
+import { describeError, explore, exploreCsvUrl, getModel, isUnavailable } from "@/lib/api";
 import { trimNumber } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -16,15 +19,11 @@ export default async function ExplorePage({ searchParams }: PageProps<"/explore"
   let model;
   try {
     [result, model] = await Promise.all([explore(query), getModel()]);
-  } catch {
+  } catch (e) {
     return (
       <main className="mx-auto max-w-6xl px-6 py-16">
         <div className="max-w-xl">
-          <Notice tone="bad">
-            The SpectrumSense API isn&rsquo;t responding. Start the backend on
-            port 8000 (<code className="mono">uvicorn app.main:app</code> in
-            <code className="mono"> backend/</code>), then reload.
-          </Notice>
+          {isUnavailable(e) ? <ApiUnavailable /> : <Notice tone="bad">{describeError(e)}</Notice>}
         </div>
       </main>
     );
@@ -100,6 +99,8 @@ export default async function ExplorePage({ searchParams }: PageProps<"/explore"
               <DecisionBadge decision={decision} />
               <ScoreBars decision={decision} />
             </div>
+            <PossibleCauses decision={decision} />
+            <EvidenceCard decision={decision} />
 
             <SignalPlots view={view} />
           </div>

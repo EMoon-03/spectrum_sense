@@ -10,6 +10,7 @@ import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 
+from causes import possible_causes
 from explore_url import (
     OFFSET,
     SEED,
@@ -64,6 +65,7 @@ from spectrum_sense import (
     classify_recording,
     decision_counts,
     decision_order,
+    explain_features,
     extract_features,
     generate_capture,
     results_csv,
@@ -71,6 +73,7 @@ from spectrum_sense import (
 from summaries import (
     constellation_summary,
     decision_summary,
+    evidence_summary,
     format_against_limit,
     format_frequency,
     format_sample_rate,
@@ -328,12 +331,20 @@ def signal_plots(
 
 
 def show_prediction(model: SignalClassifier, samples: np.ndarray, section: str) -> None:
-    """The decision (a class or "uncertain" with its reason) and a score chart."""
-    all_scores, (decision,) = classify_features(model, extract_features(samples))
+    """The decision (a class or "uncertain" with its reason), why the window
+    lies where it does, any measured cause of an "uncertain" answer, and a
+    score chart."""
+    features = extract_features(samples)
+    all_scores, (decision,) = classify_features(model, features)
     scores = all_scores[0]
     shown = "Uncertain" if decision.label == UNCERTAIN else decision.label
     st.metric("Demo model prediction", shown)
     st.write(decision_summary(decision, model.distance_threshold, model.min_top_score))
+    evidence = explain_features(model, features)
+    st.markdown(f"**Why this answer:** {evidence_summary(evidence, model.distance_threshold)}")
+    if decision.label == UNCERTAIN:
+        for cause in possible_causes(samples, features):
+            st.markdown(f"**Possible cause: {cause.title}.** {cause.detail}")
     st.markdown(UNCERTAIN_NOTE)
     score_plot = go.Figure(
         go.Bar(
@@ -880,9 +891,9 @@ with about_tab:
         f"On {demo.test_windows:,} held-out windows of noise, BPSK, and QPSK, "
         f"{demo.false_reject_rate:.1%} were answered uncertain; the other windows were "
         f"{demo.accepted_accuracy:.1%} accurate. Both rates depend on SNR: uncertain "
-        "answers and errors are most common near the bottom of the training range. At "
-        f"{SNR_DB_RANGE[0]:g} dB, most BPSK examples in the Explore tab are answered "
-        "uncertain, and some of the others are wrong."
+        "answers are most common near the bottom of the training range. At "
+        f"{SNR_DB_RANGE[0]:g} dB, nearly all BPSK examples in the Explore tab are "
+        "answered uncertain, and the rest are almost never called QPSK."
     )
     st.dataframe(
         {

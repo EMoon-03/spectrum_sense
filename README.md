@@ -9,7 +9,7 @@ own SDR recording, and read what the model measured about itself.
 It is a small, CPU-only learning exercise on synthetic data, not a validated
 RF receiver or an EW system.
 
-**3 classes · 1,024-sample windows · 376 tests · one real recording (CC BY 4.0)**
+**3 classes · 1,024-sample windows · 414 tests · one real recording (CC BY 4.0)**
 
 ---
 
@@ -17,6 +17,8 @@ RF receiver or an EW system.
 
 - [The problem](#the-problem)
 - [The central design decision](#the-central-design-decision)
+- [Why this answer](#why-this-answer)
+- [A feature bug, and what fixing it cost](#a-feature-bug-and-what-fixing-it-cost)
 - [What it looks like in practice](#what-it-looks-like-in-practice)
 - [Architecture](#architecture)
 - [The API](#the-api)
@@ -74,10 +76,106 @@ difference between "the model named QPSK" and "the model declined"; a badge
 and two numbers can.
 
 **The cost.** The checks are a heuristic tested only on synthetic probes. A
-tone is flagged nearly always, 16-QAM usually, and 8PSK only above about 10 dB
-because at 8 samples per symbol with rectangular pulses its features sit close
-to QPSK's. The Model page and `backend/tests/test_uncertain.py` report those
-rates rather than hiding them.
+tone is flagged nearly always. 8PSK is flagged almost always from 4 dB up and
+16-QAM in most windows from 4 dB, but below that noise hides the difference,
+and most 8PSK and 16-QAM windows at 0 to 2 dB are called QPSK. The Model page
+and `backend/tests/test_uncertain.py` report those rates rather than hiding
+them.
+
+## Why this answer
+
+A refusal that only says "unlike the training data" leaves the next question
+open: unlike it how? Every decision now carries its evidence, computed from
+the same fitted model and never changing an answer:
+
+- **Where the distance lies.** The squared distance to the nearest class is
+  split exactly among the eight features: the offset from the class's mean is
+  whitened with the symmetric square root of its inverse covariance, which
+  keeps each component as close as possible to its own feature, and the
+  squared components add up to the squared distance.
+- **What would fit.** A share says where the distance lies, not what caused
+  it: a feature with an ordinary value can hold a large share when it
+  disagrees with the others. So each feature also gets the value the class's
+  fit expects given the other seven, and the distance the window would have if
+  only that feature took it. That is a claim anyone can check.
+- **What pushed the scores.** The classifier is linear in the standardized
+  features, so each feature's contribution to the log-odds of the leading class
+  over the runner-up is exact, not an approximation such as SHAP.
+- **Possible causes.** For an "uncertain" window, `backend/causes.py` measures
+  three properties no training window has: the power changing within the window
+  (a burst and a gap), a bare carrier, and a steady component at 0 Hz. Each
+  names the number it measured and the margin its limit was chosen with. When
+  none fires, the page says "no measured cause" rather than guess.
+
+Window 2 of the bundled satellite recording, a stretch of real QPSK inside one
+packet (`GET /runs/{id}/windows/2`, trimmed):
+
+```json
+{
+  "label": "uncertain",
+  "reason": "unlike the training data",
+  "distance": 7.42, "distance_threshold": 4.65,
+  "evidence": {
+    "nearest_class": "QPSK",
+    "features": [
+      {"name": "fourth-power line", "value": 0.25, "expected": 0.53,
+       "distance_share": 0.44, "distance_if_expected": 4.24},
+      {"name": "lag-1 correlation", "value": 0.69, "expected": 0.55,
+       "distance_share": 0.41, "distance_if_expected": 5.44}
+    ],
+    "summary": "Most of the distance to QPSK, the nearest trained class, lies in the fourth-power line (44%) and the lag-1 correlation (41%). Given the window's other features, the QPSK fit expects about 0.53 for the fourth-power line, not 0.25; changing that alone would take the distance from 7.42 to 4.24, inside the limit of 4.65."
+  },
+  "causes": []
+}
+```
+
+The recording's root-raised-cosine pulses spend much of each symbol between
+the four phases, so the fourth-power line, the clearest sign of QPSK, is about
+half as strong as in the model's rectangular-pulse training data. The model
+declines, and now it says why. Window 1, which straddles a packet edge, gets a
+measured cause instead: "The loudest eighth of the window is 7.3 dB above the
+quietest; in training windows they differ by at most about 2 dB."
+
+## A feature bug, and what fixing it cost
+
+The first two features measure the spectral line that squaring a BPSK signal,
+or raising a QPSK signal to the fourth power, produces. They used to do it by
+estimating the carrier offset from neighboring samples, removing it, and
+averaging. At 14 dB that estimate is typically off by 0.0004 cycles per sample
+for BPSK and 0.001 for QPSK: enough to turn the squared BPSK signal through
+most of a cycle over a 1,024-sample window and QPSK's fourth power through
+about five, so the average washed the line out: the median BPSK window scored 0.28
+on the squared-signal line where about 0.96 is achievable, and the median QPSK
+window scored 0.04 on the fourth-power line, below noise (0.14). Nothing failed,
+because every number the app reported had been measured with the broken
+features.
+
+`spectrum_sense.line_strength` now finds the strongest line wherever it lies:
+a spectrum zero-padded to four times the window length finds the peaks, and a
+few Newton steps on the exact spectrum find each peak's top. No carrier
+estimate is needed, and a frequency shift changes no feature (to about
+1e-12), which `backend/tests/test_prepare.py` checks. Training takes about 0.6
+s instead of 0.2 s.
+
+Measured with the app's model (seed 42) and the same probe captures:
+
+| | Before | After |
+| --- | --- | --- |
+| 8PSK flagged "uncertain" at 4, 6, 8 dB | 0%, 2%, 10% | 98%, 100%, 100% |
+| 8PSK flagged at 10 dB | 63% | 100% |
+| 16-QAM flagged at 4 dB | 73% | 82% |
+| 16-QAM flagged at 0 dB | 29% | 17% |
+| Held-out windows answered "uncertain" | 4.7% | 6.7% |
+| Accuracy on the held-out windows it answered | 99.7% | 100% |
+| BPSK at -2 dB in Explore (100 seeds) | 75 uncertain, 10 called QPSK | 95 uncertain, none called QPSK |
+
+The cost shows on real recordings. Both versions answer "uncertain" for every
+window of real over-the-air BPSK from MIGOU-MOD. On the whole Intelsat 37e
+recording, the old features named 87 of the 104 windows that lie inside a
+packet QPSK, all correctly; the new ones decline all 104, because they can now
+see the pulse-shape difference shown above. Declining is consistent with what
+the model knows. Training on pulse-shaped signals is the next experiment (see
+[Not built](#not-built)), and its result has to beat these numbers.
 
 ## What it looks like in practice
 
@@ -89,15 +187,17 @@ Real responses from the API, trimmed to the relevant fields.
 {
   "settings": {"signal": "QPSK", "snr_db": 3.0, "offset": 0.012, "seed": 7},
   "in_training_range": {"snr": true, "offset": false},
-  "model_version": "4f21335020a6029b",
+  "model_version": "807457d77ef0e01a",
   "decision": {
     "label": "QPSK",
     "reason": null,
-    "distance": 3.17, "distance_threshold": 4.43,
-    "top_score": 0.97, "min_top_score": 0.6,
+    "distance": 3.12, "distance_threshold": 4.65,
+    "top_score": 0.99, "min_top_score": 0.6,
     "classes": ["noise", "BPSK", "QPSK"],
-    "scores": [0.00003, 0.029, 0.970],
-    "summary": "The model names QPSK: the window is 3.17 from the nearest trained class (limit 4.43) and the top score is 0.97 (minimum 0.60)."
+    "scores": [0.00007, 0.005, 0.994],
+    "summary": "The model names QPSK: the window is 3.12 from the nearest trained class (limit 4.65) and the top score is 0.99 (minimum 0.60).",
+    "evidence": {"nearest_class": "QPSK", "features": ["...eight entries..."], "summary": "..."},
+    "causes": []
   }
 }
 ```
@@ -113,9 +213,13 @@ a page may forget to show.
   "label": "uncertain",
   "reason": "unlike the training data",
   "leading": "BPSK",
-  "top_score": 0.64, "min_top_score": 0.6,
-  "distance": 4.52, "distance_threshold": 4.43,
-  "summary": "Uncertain because the window is unlike the training data: it is 4.52 from the nearest trained class, beyond the limit of 4.43. The leading candidate is BPSK with a score of 0.64."
+  "top_score": 0.77, "min_top_score": 0.6,
+  "distance": 6.01, "distance_threshold": 4.65,
+  "summary": "Uncertain because the window is unlike the training data: it is 6.01 from the nearest trained class, beyond the limit of 4.65. The leading candidate is BPSK with a score of 0.77.",
+  "evidence": {
+    "nearest_class": "BPSK",
+    "summary": "Most of the distance to BPSK, the nearest trained class, lies in the squared-signal line (49%) and the lag-1 correlation (30%). Given the window's other features, the BPSK fit expects about 0.60 for the four-phase symbol steps, not 0.13; changing that alone would take the distance from 6.01 to 4.56, inside the limit of 4.65."
+  }
 }
 ```
 
@@ -123,30 +227,36 @@ a page may forget to show.
 
 ```json
 {
-  "run_id": "RL63SusOuGgllLr5",
-  "model_version": "4f21335020a6029b",
+  "run_id": "KMiCVXARIUMw2DwW",
+  "model_version": "807457d77ef0e01a",
   "preparation": {
     "steps": ["Resampled by 2/1 from 500 samples per second to 1 thousand samples per second, which gives 8 samples per symbol at 125 symbols per second."],
     "ratio": [2, 1], "samples_per_symbol": 8.0, "filled_share": 0.5,
     "band_note": "Only about 50% of the prepared band holds the recording's signal and noise; the higher sample rate left the rest empty. The model learned noise that fills the whole band, so expect more \"uncertain\" answers."
   },
   "counts": [{"label": "noise", "count": 0}, {"label": "BPSK", "count": 0},
-             {"label": "QPSK", "count": 0}, {"label": "uncertain", "count": 60}]
+             {"label": "QPSK", "count": 0}, {"label": "uncertain", "count": 60}],
+  "causes_summary": "Of the 60 uncertain windows, 16 change power within the window; 44 show no measured cause."
 }
 ```
 
-All 60 windows are uncertain, every one of them 40+ distance units from the
-nearest class. The model expects rectangular pulses in a full band; it was
+All 60 windows are uncertain, every one of them at least 9.5 from the nearest
+class, twice the limit. The model expects rectangular pulses in a full band; it was
 given root-raised-cosine pulses in half a band. Declining is the right answer,
 and the `band_note` says why before the user asks.
 
 **Every result carries the model fingerprint.** The model is retrained from a
 fixed seed at every process start, so an edit to the features or the training
 settings silently changes every answer. `model_version` hashes the training
-settings, `signal_config.py`, and the source of the feature, training, and
-decision functions. It is in `/health`, every response, and the last column of
-every per-window CSV, so two CSVs from different months are comparable or
-visibly not.
+settings, `signal_config.py`, the source of every function and class in
+`spectrum_sense.py` that generates, measures, trains, or decides, and the
+versions of Python, NumPy, SciPy, and scikit-learn, since a library upgrade can
+change an answer too (so the fingerprint above may differ from yours).
+`backend/tests/test_model_version.py` fails when `spectrum_sense.py` gains a
+function that is neither fingerprinted nor listed with the reason it cannot
+change an answer. The fingerprint is in `/health`, every response, and the last
+column of every per-window CSV, so two CSVs from different months are
+comparable or visibly not.
 
 ## Architecture
 
@@ -165,9 +275,11 @@ backend/
 │   ├── views.py             a window's decision and three plots, with summaries
 │   ├── analysis.py          analyze, re-prepare, serialize a run
 │   ├── runs.py              in-memory run cache (nothing touches disk)
+│   ├── uploads.py           upload limit before reading; uploads stay in memory
 │   └── routers/             /model, /explore, /analyze + /runs, /example
-├── spectrum_sense.py        generator, features, training, decide(), CLI baseline
-├── signal_config.py         shared settings: classes, window, ranges, limits
+├── spectrum_sense.py        generator, features, training, decide(), evidence, CLI baseline
+├── causes.py                possible causes of an "uncertain" answer
+├── signal_config.py         shared settings: classes, feature names, ranges, limits
 ├── prepare.py               shift, filter, resample; loudest windows
 ├── iq_formats.py            CSV, raw SDR, NumPy, WAV, SigMF readers
 ├── spectrogram.py           whole-recording spectrogram
@@ -175,14 +287,15 @@ backend/
 ├── explore_url.py           shareable-link parsing with snapping and notes
 ├── real_example.py          the bundled recording's credit and description
 ├── streamlit_app.py         the Streamlit lab
-├── tools/                   fetch and evaluate real recordings
+├── tools/                   fetch and evaluate real recordings; dump the OpenAPI document
 ├── examples/                the bundled recording and its attribution
-└── tests/                   376 tests
+└── tests/                   414 tests
 frontend/
 └── src/
     ├── app/                 /, /explore, /analyze, /model, /about
-    ├── components/          DecisionBadge, ScoreBars, SignalPlots, Spectrogram,
-    │                        WindowTimeline, PreparePanel, AnalyzePanel, ...
+    ├── components/          DecisionBadge, ScoreBars, EvidenceCard, PossibleCauses,
+    │                        SignalPlots, Spectrogram, WindowTimeline, PreparePanel,
+    │                        AnalyzePanel, ApiUnavailable, ...
     └── lib/
         ├── api.ts           typed client
         ├── api.generated.ts types generated from the API's OpenAPI document
@@ -198,7 +311,9 @@ work.
 `api.generated.ts` from `/openapi.json`, and `api.ts` re-exports from it. A
 field renamed in `schemas.py` fails `npm run build` instead of appearing as a
 runtime `undefined`. The generated file is committed so the frontend builds
-without a running backend.
+without a running backend, and a CI job keeps it honest: it writes the
+OpenAPI document with `backend/tools/dump_openapi.py` (no server needed),
+regenerates the types, and fails if they differ from the committed file.
 
 **The address is the state.** On the Explore page, `/explore?signal=QPSK&snr=3&offset=0.012&seed=7`
 is a server-rendered page, so a link reproduces the example exactly and the
@@ -210,7 +325,11 @@ address but not the example.
 decision and the spectrogram at once, then the client reads one window's plots
 at a time, re-prepares with other settings, or downloads the CSV, all by run
 id. The recording is held for 30 minutes (or until 32 newer runs push it out)
-and never written to disk. A reload with `?run=` in the address reads the run
+and never written to disk: `app/uploads.py` refuses a body over the limit from
+its `Content-Length` before reading it, and keeps every accepted upload in
+memory, where Starlette would otherwise move a file over 1 MB to a temporary
+file (a test fails if one is created). The analysis runs in a worker thread,
+so one upload does not hold up other requests. A reload with `?run=` in the address reads the run
 back; a forgotten run is a 404 whose message says to analyze again.
 
 **Charts carry their own numbers.** Every chart has a text summary beneath it
@@ -226,33 +345,42 @@ labelled colour bar and hover values. Colours are Okabe-Ito throughout.
 | --- | --- |
 | `GET /health` | `ok` once the model has trained, with its fingerprint; Render's health check |
 | `GET /model` | training settings, the "uncertain" limits, held-out accuracy by SNR band, probe flag rates, and the Explore control ranges |
-| `GET /explore?signal&snr&offset&seed` | one simulated window: decision, plots, summaries, `in_training_range`, and `notes` for any link value that was snapped or ignored |
+| `GET /explore?signal&snr&offset&seed` | one simulated window: decision with its evidence and possible causes, plots, summaries, `in_training_range`, and `notes` for any link value that was snapped or ignored |
 | `GET /explore/csv?…` | the same window as `I,Q` text |
 | `POST /analyze` | multipart: one recording (or a SigMF pair) plus optional preparation settings |
 | `POST /analyze/example` | the bundled recording, same response |
-| `GET /runs/{id}` | the analysis again |
+| `GET /runs/{id}` | the analysis again, with each window's possible causes and their counts |
 | `POST /runs/{id}/prepare` | other settings for the same recording, same run id |
-| `GET /runs/{id}/windows/{n}` | one window's level, decision, and plots |
+| `GET /runs/{id}/windows/{n}` | one window's level, decision (with evidence and possible causes), and plots |
 | `GET /runs/{id}/results.csv` | per-window results with the preparation and `model_version` columns |
 | `GET /example`, `GET /example/file` | the bundled recording's credit and the file itself |
 
-Errors: 413 for an upload over the limit, 422 with the reader's own message
+Errors: 413 for an upload over the limit, 411 for an upload without a
+`Content-Length`, 422 with the reader's own message
 for a file or settings it rejects (never repeating text from the file), 404
 for a forgotten run. The full document is at `/docs`.
 
 ## Testing
 
-**376 tests**, all offline, run on Python 3.10 and 3.12 by GitHub Actions
-alongside the frontend's lint and type-checked build.
+**414 tests**, all offline, run on Python 3.10 and 3.12 by GitHub Actions
+alongside the frontend's lint and type-checked build and the check that the
+committed API types match the backend.
 
 - `test_api.py` covers the HTTP boundary: every route, every error code, the
   guarantees the schemas make (reasons and limits travel with decisions, NaN
   never crosses, the fingerprint is everywhere, file text is never echoed),
-  CORS, cache eviction, and that the bundled recording gives the documented
-  counts (8 QPSK and 22 uncertain; 60 uncertain after resampling).
+  CORS, cache eviction, upload limits (refused before reading, never written
+  to disk), and that the bundled recording gives the documented counts (30
+  uncertain, 20 of them with a power step; 60 uncertain after resampling).
 - `test_uncertain.py` repeats the measurements the Model page shows: the
   false-reject rate, accuracy when answered, and the probe flag rates by SNR,
   with floors that fail the build if the model drifts.
+- `test_evidence.py` checks that the distance shares add up exactly, that
+  each "expected" value gives exactly the distance it promises and that no
+  nearby value does better, that the score pushes rebuild the log-odds, and
+  that explaining never changes a decision. `test_causes.py` repeats the
+  margins each possible cause was chosen with, and `test_model_version.py`
+  fails when decision code escapes the fingerprint.
 - `test_app.py` and `test_startup_and_reruns.py` run the Streamlit lab
   headless with `AppTest`, including its shareable links and its caching.
 - The readers, CSV round trips, preparation, spectrogram, summaries, link
@@ -279,6 +407,14 @@ are a liability.
 **Decide early what a result's identity is.** The per-window CSV existed for
 months with a `preparation` column and no model fingerprint. Any change to
 `extract_features` would have invalidated every saved CSV invisibly.
+
+**Test each feature against the signal it is meant to detect.** The squared
+and fourth-power features washed their lines out for months (see
+[A feature bug](#a-feature-bug-and-what-fixing-it-cost)), and every regression
+test passed, because the floors were measured with the broken features. One
+test that a clean QPSK window at 14 dB scores high on the fourth-power line
+would have caught it on the first day. Measuring the evidence for each
+decision is what finally exposed it.
 
 ## Running it
 
@@ -324,8 +460,15 @@ an example run.
 `render.yaml` deploys the API on Render's free plan with `/health` as the
 health check; set `ALLOWED_ORIGINS` to the frontend's exact origin. Deploy
 `frontend/` on Vercel with `NEXT_PUBLIC_API_URL` set to the API's address.
-The model trains in under a second at startup; the first cold start on the
-free plan is dominated by importing scikit-learn and SciPy.
+The model trains in under a second at startup.
+
+The free plan puts the API to sleep when it is idle, and waking it can take
+most of a minute. The pages wait for it instead of failing: a server-rendered
+request gives up after 8 seconds, and the page then says the server is waking
+up, asks `/health` from the browser every 3 seconds, and loads itself once the
+API answers "ok" (after 90 seconds it offers to try again). Against an API on
+`localhost`, the same pages say to start the backend instead. The browser's
+checks need `ALLOWED_ORIGINS` to include the frontend's origin, as uploads do.
 
 A hosted app runs on someone else's server: files uploaded to it are sent
 there. Upload only recordings you are allowed to share.
@@ -403,7 +546,7 @@ steps from `backend/prepare.py` run in this order before any analysis:
 
 1. **Carrier offset to remove** shifts the recording so that the frequency you
    enter, read from the spectrogram, moves to 0 Hz. A shift alone changes no
-   answer, because the features already remove a steady frequency offset; it
+   answer, because no feature depends on where the signal lies in frequency; it
    matters before the next two steps, which keep only the band around 0 Hz.
 2. **Bandwidth to keep** runs a linear-phase low-pass filter (Hamming-windowed,
    at most 1,001 taps) that keeps that band around 0 Hz. Mirrored samples at
@@ -436,10 +579,10 @@ within the training range (100 captures of each type and timing;
 
 - **Resampling to a lower rate helps.** At 20 samples per symbol, every window
   was answered "uncertain" as recorded. Resampled by 2/5 to 8 samples per
-  symbol, 68% of BPSK and 81% of QPSK windows were named correctly, and the
+  symbol, 65% of BPSK and 88% of QPSK windows were named correctly, and the
   rest were uncertain.
-- **Resampling to a higher rate does not.** At 4 samples per symbol, 57% of
-  BPSK and 53% of QPSK windows were named correctly as recorded, and the rest
+- **Resampling to a higher rate does not.** At 4 samples per symbol, 33% of
+  BPSK and 62% of QPSK windows were named correctly as recorded, and the rest
   were uncertain. Resampled by 2/1, every window was uncertain: interpolation
   fills only the old band, so half of the new band holds no noise, unlike the
   noise the model learned. A filter narrower than the band leaves part of it
@@ -527,23 +670,29 @@ band, much like the white noise the "noise" class was trained on.
 
 The model expects rectangular pulses at 8 samples per symbol; this recording
 has root-raised-cosine pulses at 4, and a 1,024-sample window often mixes
-packet and gap. An answer on it is an experiment, not a score. When we tried
-it in September 2026, most windows came back "uncertain": 84 of the 97 windows
-in samples 0 to 99,999, and 69 of 97 in samples 200,000 to 299,999. The rest
-were called QPSK (11 and 28 windows, almost all in the loudest third) or noise
-(2 windows, in the first excerpt); none was called BPSK. The quietest third of
-the windows, mostly gaps, were nearly all uncertain. A QPSK answer is weak
-evidence even so: before the "uncertain" answer existed, the loudest in-packet
-window was called QPSK with a score of 0.975, but so was a recording of analog
-FM.
+packet and gap. An answer on it is an experiment, not a score.
+`python tools/evaluate_real.py --fetch` classifies every window of the whole
+recording, and of the start of MIGOU-MOD (real BPSK sent over the air, below),
+and sorts the Intelsat windows by power into inside a packet, in a gap, or
+mixed. In October 2026 the model answered "uncertain" for 575 of the
+recording's 582 windows: all 104 inside a packet and all but one of the 472
+mixed ones, which was called QPSK. The 6 windows in a gap were all called
+noise. Every one of MIGOU-MOD's 1,098 BPSK windows was uncertain too, as
+recorded and resampled to 8 samples per symbol. Before the
+[feature fix](#a-feature-bug-and-what-fixing-it-cost), the same tool counted
+87 of the 104 in-packet windows as QPSK, all correctly. A QPSK answer was weak
+evidence even then: before the "uncertain" answer existed, the loudest
+in-packet window was called QPSK with a score of 0.975, but so was a recording
+of analog FM.
 
 The bundled excerpt shows why. Its gaps (about 900 samples) are shorter than a
-window, so 20 of its 30 windows mix gap and packet: their power jumps by about
-6 dB partway through, which no training window does, and all 20 are answered
-"uncertain" as unlike the training data. Of the 10 windows that lie entirely
-inside a packet, 8 are called QPSK and 2 are uncertain. Gap samples joined
-into whole windows are nearly all called noise (146 of 150 such windows in our
-test), but no window of the excerpt is gap alone.
+window, so 20 of its 30 windows mix gap and packet: their power jumps by 6 to
+8 dB partway through, which no training window does, and all 20 are answered
+"uncertain" as unlike the training data, with that power change named as a
+possible cause. The 10 windows that lie entirely inside a packet are
+"uncertain" too: their fourth-power line is about half what the QPSK fit
+expects, and each one's evidence says so. No window of the excerpt is gap
+alone.
 
 Preparing the excerpt does not help. Resampled to 8 samples per symbol (a
 symbol rate of 125), it holds 60 windows, and all of them are answered
@@ -561,7 +710,7 @@ Checked in September 2026; services and their rules can change.
 | Zenodo API | Free, no account: `GET https://zenodo.org/api/records/<id>`, files at `/api/records/<id>/files/<key>/content`. Range requests work, anonymous searches return at most 25 results, and rate limits apply. | Published datasets, some in SigMF | Set per record (13371136: CC BY 4.0) | Direct, with `backend/tools/fetch_real_iq.py` |
 | [IQEngine](https://iqengine.org) | Its web app's backend (`https://iqengine.org/api/datasources/local/local/...`) needs no login but is undocumented, may change without notice, and refuses the default Python User-Agent (HTTP 403). | SigMF metadata and blocks of I/Q from community recordings | Most recordings state none | Good for browsing; without a license, keep excerpts to yourself |
 | KiwiSDR | Public shortwave receivers over the internet, recorded with `kiwirecorder.py` from [kiwiclient](https://github.com/jks-prv/kiwiclient): `python3 kiwirecorder.py -s HOST -p 8073 -f <kHz> -m iq --tlimit=8 --user=YOURNAME` | A WAV file of 2-channel int16 I/Q at about 12 kHz (the header rounds the rate to a whole number, such as 11999); `--kiwi-wav` adds `kiwi` chunks between several data chunks | None: these are other people's transmissions | Direct: upload the WAV file, with or without `--kiwi-wav`. At about 12,000 samples per second, `--tlimit=8` stays under the 100,000-sample limit (a 10-second recording held 120,832 samples) |
-| [SatNOGS Network](https://network.satnogs.org) | Free API, for example `https://network.satnogs.org/api/observations/?status=good&transmitter_mode=BPSK` | Satellite passes as demodulated audio (Ogg), not I/Q | CC BY-SA 4.0 | Indirect: a Hilbert transform of the audio gives pseudo-I/Q; in one test, a real 1200-baud BPSK packet made this way was classified as BPSK |
+| [SatNOGS Network](https://network.satnogs.org) | Free API, for example `https://network.satnogs.org/api/observations/?status=good&transmitter_mode=BPSK` | Satellite passes as demodulated audio (Ogg), not I/Q | CC BY-SA 4.0 | Indirect: a Hilbert transform of the audio gives pseudo-I/Q; in one test with the earlier features, a real 1200-baud BPSK packet made this way was classified as BPSK |
 | [MIGOU-MOD](https://data.mendeley.com/datasets/fkwr8mzndr) (Mendeley Data, doi:10.17632/fkwr8mzndr.1) | Free; one 3.3 GB zip, described by `https://data.mendeley.com/public-api/datasets/fkwr8mzndr` | Real over-the-air recordings of RadioML-2016-style transmitters, labeled by modulation, BPSK included | CC BY 4.0 | Labeled real BPSK. The zip holds a Python pickle: read its float32 arrays with HTTP range requests, and never unpickle a downloaded file |
 | Your own RTL-SDR | A dongle costs about $35 to $50. Arch Linux: `sudo pacman -S rtl-sdr`; Python: `pip install pyrtlsdr` (0.5.0) | `rtl_sdr` writes `.cu8`, which the app reads (trim it to 100,000 samples) | Yours to share, within the notes below | Full control over what you record; see the RDS recipe below |
 
@@ -591,8 +740,8 @@ rds[:100_000].astype(np.complex64).tofile("rds.cf32")
 
 The Analyze page's preparation controls can shift, filter, and resample a recording,
 but not FM-demodulate it, so this recipe needs Python. Matching timing is not
-enough on its own: when we ran this recipe on one sample FM capture, every
-window of the result was answered "uncertain". For QPSK, try the LRPT downlink
+enough on its own: when we ran this recipe on one sample FM capture (with the
+earlier features), every window of the result was answered "uncertain". For QPSK, try the LRPT downlink
 of a Meteor-M weather satellite (137.9 or 137.1 MHz, root-raised-cosine pulses
 at 72,000 symbols per second) during a pass. ADS-B aircraft signals at 1090
 MHz use pulse-position modulation, a good negative example: the right answer
@@ -635,8 +784,11 @@ downloads timed out when we tried).
 - No frontend tests beyond lint and the type-checked build; the Streamlit lab
   keeps its `AppTest` coverage for that reason
 - The model is the synthetic baseline: three classes, rectangular pulses, no
-  fading. 16-QAM, pulse shaping, a validation split by capture, and a small
-  PyTorch model on raw I/Q are the next experiments, each with the same
-  train/validation/test capture ids
+  fading. Pulse-shaped training comes first, since the fourth-power line
+  shows that real root-raised-cosine QPSK is unlike the training data; an
+  earlier trial named pulse-shaped BPSK and QPSK but stopped catching 16-QAM
+  until features taken at the symbol instants, after a matched filter, were
+  added. Then 16-QAM as a class, a validation split by capture, and a small
+  PyTorch model on raw I/Q, each with the same train/validation/test capture ids
 - Rule-based link parsing, so an unusual link value falls back to a default
   with a note rather than failing

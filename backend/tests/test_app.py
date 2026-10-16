@@ -733,7 +733,7 @@ class RealRecordingTests(AppTestCase):
         for fragment in (
             AUTHOR, f"[doi:{DOI}]({DOI_URL})", f"[{LICENSE}]({LICENSE_URL})",
             "64-symbol BPSK syncword", "4 samples per symbol", "8 samples per symbol",
-            "stronger than the gaps", 'Why so many windows are "uncertain"',
+            "stronger than the gaps", 'Why every window is "uncertain"',
         ):
             self.assertIn(fragment, CREDIT + ABOUT)
         self.assertEqual(
@@ -1068,8 +1068,8 @@ class UncertainAndWholeFileTests(AppTestCase):
         )
         # test_uncertain.py checks this claim about the Explore tab.
         self.assertIn(
-            f"At {SNR_DB_RANGE[0]:g} dB, most BPSK examples in the Explore tab are answered "
-            "uncertain, and some of the others are wrong.",
+            f"At {SNR_DB_RANGE[0]:g} dB, nearly all BPSK examples in the Explore tab are "
+            "answered uncertain, and the rest are almost never called QPSK.",
             text,
         )
         by_snr, table = about.dataframe

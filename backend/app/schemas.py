@@ -108,6 +108,44 @@ class ModelReport(BaseModel):
 # --- decisions and views ----------------------------------------------------
 
 
+class FeatureEvidenceOut(BaseModel):
+    name: str
+    description: str
+    value: float
+    expected: float = Field(
+        description="The value the nearest class's fit expects, given the window's other features"
+    )
+    distance_share: float = Field(
+        description="Share of the squared distance to the nearest class, 0 to 1; shares sum to 1"
+    )
+    distance_if_expected: float = Field(
+        description="The distance to the nearest class if only this feature took the expected value"
+    )
+    score_push: float = Field(
+        description="Log-odds this feature adds for the leading class over the runner-up"
+    )
+
+
+class EvidenceOut(BaseModel):
+    """Where a window's features lie: the distance shares say where the
+    distance to the nearest class lies, not what caused it."""
+
+    nearest_class: str = Field(description="The trained class the distance is measured to")
+    distance: float
+    leading: str
+    runner_up: str
+    features: list[FeatureEvidenceOut] = Field(description="In extract_features order")
+    summary: str
+
+
+class CauseOut(BaseModel):
+    """Something measured in the window that no training window shows."""
+
+    key: Literal["power-step", "bare-carrier", "center-component"]
+    title: str
+    detail: str
+
+
 class Decision(BaseModel):
     """One window's answer. `label` is a trained class, "uncertain", or
     "not classifiable". A client should show `reason` whenever it is set,
@@ -124,6 +162,12 @@ class Decision(BaseModel):
     scores: list[Optional[float]] = Field(description="One per class, in `classes` order")
     summary: str = Field(description="The decision in one or two plain sentences")
     scores_summary: str
+    # None where the window is not classifiable.
+    evidence: Optional[EvidenceOut] = None
+    causes: list[CauseOut] = Field(
+        default_factory=list,
+        description="Measured properties no training window has; possible causes of an uncertain answer",
+    )
 
 
 class Samples(BaseModel):
@@ -223,11 +267,18 @@ class WindowDecision(BaseModel):
     distance: Optional[float] = None
     top_score: Optional[float] = None
     scores: list[Optional[float]]
+    causes: list[str] = Field(default_factory=list, description="Keys of the window's CauseOut list")
 
 
 class DecisionCount(BaseModel):
     label: str
     count: int
+
+
+class CauseCount(BaseModel):
+    key: str
+    title: str
+    count: int = Field(description="Uncertain windows that show this cause")
 
 
 class SpectrogramOut(BaseModel):
@@ -278,6 +329,8 @@ class AnalyzeResponse(BaseModel):
     counts: list[DecisionCount]
     ignored_samples: int = Field(description="Trailing samples after the last complete window")
     timeline_summary: str
+    cause_counts: list[CauseCount] = Field(description="Every cause, counted among uncertain windows")
+    causes_summary: str
     distance_threshold: float
     min_top_score: float
     spectrogram: SpectrogramOut

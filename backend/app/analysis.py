@@ -12,6 +12,7 @@ import math
 import numpy as np
 
 import real_example
+from causes import TITLES as CAUSE_TITLES, causes_summary, possible_causes
 from iq_csv import MAX_SAMPLES
 from iq_formats import Recording, load_uploads, select_uploads
 from prepare import (
@@ -22,13 +23,14 @@ from prepare import (
     result_summary,
     window_levels,
 )
-from signal_config import SAMPLES_PER_WINDOW
+from signal_config import SAMPLES_PER_WINDOW, UNCERTAIN
 from spectrogram import FLOOR_DB, compute_spectrogram
 from spectrum_sense import (
     DemoModel,
     classify_recording,
     decision_counts,
     decision_order,
+    extract_features,
     results_csv,
 )
 from summaries import spectrogram_summary, timeline_summary
@@ -130,9 +132,27 @@ def example_info() -> schemas.ExampleInfo:
     )
 
 
+def _features_or_none(window: np.ndarray) -> np.ndarray | None:
+    try:
+        return extract_features(window)
+    except ValueError:
+        return None
+
+
+def window_causes(samples: np.ndarray, starts) -> list[list[str]]:
+    """Each window's possible-cause keys (see causes.py)."""
+    found = []
+    for start in starts:
+        window = samples[start : start + SAMPLES_PER_WINDOW]
+        found.append([cause.key for cause in possible_causes(window, _features_or_none(window))])
+    return found
+
+
 def to_response(demo: DemoModel, run: Run) -> schemas.AnalyzeResponse:
     result, prepared, spectrogram = run.result, run.prepared, run.spectrogram
     recording = prepared.recording
+    causes = window_causes(recording.samples, result.starts)
+    uncertain = [keys for label, keys in zip(result.labels, causes) if label == UNCERTAIN]
     rate, center = recording.sample_rate, recording.center_frequency
     order = decision_order(result.classes)
     frequencies, frequency_title = spectrogram.frequency_axis(rate)
@@ -148,6 +168,7 @@ def to_response(demo: DemoModel, run: Run) -> schemas.AnalyzeResponse:
             if not np.isnan(result.scores[index]).all()
             else None,
             scores=[_finite(value) for value in reorder(result.classes, result.scores[index])],
+            causes=causes[index],
         )
         for index, start in enumerate(result.starts)
     ]
@@ -185,6 +206,11 @@ def to_response(demo: DemoModel, run: Run) -> schemas.AnalyzeResponse:
         counts=[schemas.DecisionCount(label=name, count=count) for name, count in decision_counts(result)],
         ignored_samples=result.ignored_samples,
         timeline_summary=timeline_summary(result.labels, order),
+        cause_counts=[
+            schemas.CauseCount(key=key, title=title, count=sum(key in keys for keys in uncertain))
+            for key, title in CAUSE_TITLES.items()
+        ],
+        causes_summary=causes_summary(result.labels, causes),
         distance_threshold=demo.model.distance_threshold,
         min_top_score=demo.model.min_top_score,
         spectrogram=schemas.SpectrogramOut(

@@ -1,7 +1,8 @@
 import Link from "next/link";
+import ApiUnavailable from "@/components/ApiUnavailable";
 import Notice from "@/components/Notice";
 import RatesChart from "@/components/RatesChart";
-import { getModel } from "@/lib/api";
+import { describeError, getModel, isUnavailable } from "@/lib/api";
 import { formatPct } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -20,11 +21,11 @@ export default async function ModelPage() {
   let model;
   try {
     model = await getModel();
-  } catch {
+  } catch (e) {
     return (
       <main className="mx-auto max-w-6xl px-6 py-16">
         <div className="max-w-xl">
-          <Notice tone="bad">The SpectrumSense API isn&rsquo;t responding. Start the backend on port 8000, then reload.</Notice>
+          {isUnavailable(e) ? <ApiUnavailable /> : <Notice tone="bad">{describeError(e)}</Notice>}
         </div>
       </main>
     );
@@ -114,7 +115,7 @@ export default async function ModelPage() {
             </tbody>
           </table>
           <p className="mt-3 max-w-[68ch] text-sm leading-relaxed text-ink-faint">
-            A tone is flagged nearly always; 16-QAM usually; 8PSK only at high SNR, because at 8 samples per symbol with rectangular pulses its features sit close to QPSK&rsquo;s. This is a simple heuristic tested only on synthetic probes, not validated unknown-signal detection.
+            A tone is flagged nearly always. 8PSK is flagged almost always from 4 dB up, mostly through the fourth-power line, which QPSK has and 8PSK lacks; 16-QAM in most windows from 4 dB and nearly all from 8 dB. Below 4 dB, noise hides the difference, and most 8PSK and 16-QAM windows at 0 to 2 dB are called QPSK. This is a simple heuristic tested only on synthetic probes, not validated unknown-signal detection.
           </p>
         </section>
 

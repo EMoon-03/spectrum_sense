@@ -1,5 +1,11 @@
 import Link from "next/link";
+import { Suspense } from "react";
+import ApiUnavailable from "@/components/ApiUnavailable";
 import { getHealth } from "@/lib/api";
+
+export const dynamic = "force-dynamic";
+
+const STATUS = "mono mt-6 text-xs text-ink-faint";
 
 const PATHS = [
   {
@@ -19,9 +25,18 @@ const PATHS = [
   },
 ];
 
-export default async function Home() {
+/** The API's status line. It streams in after the rest of the page, so a
+ *  sleeping API never holds up the overview. */
+async function ApiStatus() {
   const health = await getHealth().catch(() => null);
+  return (
+    <p className={STATUS}>
+      {health?.status === "ok" ? `API ok · model ${health.model.version}` : <ApiUnavailable inline />}
+    </p>
+  );
+}
 
+export default function Home() {
   return (
     <main>
       <section className="border-b border-rule bg-surface">
@@ -45,11 +60,9 @@ export default async function Home() {
               Analyze a recording
             </Link>
           </div>
-          <p className="mono mt-6 text-xs text-ink-faint">
-            {health
-              ? `API ${health.status} · model ${health.model.version}`
-              : "API not reachable: start the backend on port 8000"}
-          </p>
+          <Suspense fallback={<p className={STATUS}>Checking the API…</p>}>
+            <ApiStatus />
+          </Suspense>
         </div>
       </section>
 

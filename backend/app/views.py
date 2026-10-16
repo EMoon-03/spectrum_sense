@@ -11,11 +11,19 @@ import math
 
 import numpy as np
 
-from signal_config import CLASSES, NOT_CLASSIFIABLE
-from spectrum_sense import SignalClassifier, classify_features, extract_features
+from causes import possible_causes
+from signal_config import CLASSES, FEATURES, NOT_CLASSIFIABLE
+from spectrum_sense import (
+    FeatureEvidence,
+    SignalClassifier,
+    classify_features,
+    explain_features,
+    extract_features,
+)
 from summaries import (
     constellation_summary,
     decision_summary,
+    evidence_summary,
     scores_summary,
     spectrum_db,
     spectrum_summary,
@@ -66,9 +74,11 @@ def decision_for(model: SignalClassifier, samples: np.ndarray) -> schemas.Decisi
             scores=[None] * len(classes),
             summary=f"This window is {NOT_CLASSIFIABLE}: {exc}",
             scores_summary="No scores: the window's features cannot be computed.",
+            causes=causes_out(samples, None),
         )
     all_scores, (decision,) = classify_features(model, features)
     scores = [float(score) for score in reorder(model.classes, all_scores[0])]
+    evidence = explain_features(model, features)
     return schemas.Decision(
         label=decision.label,
         reason=decision.reason,
@@ -81,6 +91,37 @@ def decision_for(model: SignalClassifier, samples: np.ndarray) -> schemas.Decisi
         scores=scores,
         summary=decision_summary(decision, model.distance_threshold, model.min_top_score),
         scores_summary=scores_summary(classes, scores),
+        evidence=evidence_out(evidence, model.distance_threshold),
+        causes=causes_out(samples, features),
+    )
+
+
+def causes_out(samples: np.ndarray, features: np.ndarray | None) -> list[schemas.CauseOut]:
+    return [
+        schemas.CauseOut(key=cause.key, title=cause.title, detail=cause.detail)
+        for cause in possible_causes(samples, features)
+    ]
+
+
+def evidence_out(evidence: FeatureEvidence, distance_threshold: float) -> schemas.EvidenceOut:
+    return schemas.EvidenceOut(
+        nearest_class=evidence.nearest,
+        distance=evidence.distance,
+        leading=evidence.leading,
+        runner_up=evidence.runner_up,
+        features=[
+            schemas.FeatureEvidenceOut(
+                name=name,
+                description=description,
+                value=float(evidence.values[index]),
+                expected=float(evidence.expected[index]),
+                distance_share=float(evidence.distance_shares[index]),
+                distance_if_expected=float(evidence.distance_if_expected[index]),
+                score_push=float(evidence.score_push[index]),
+            )
+            for index, (name, description) in enumerate(FEATURES)
+        ],
+        summary=evidence_summary(evidence, distance_threshold),
     )
 
 

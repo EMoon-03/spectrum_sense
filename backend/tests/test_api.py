@@ -15,6 +15,8 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
+from unittest.mock import patch
 
 import numpy as np
 
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.formparsers import MultiPartParser  # noqa: E402
 
 import iq_csv  # noqa: E402
 import real_example  # noqa: E402
@@ -29,7 +32,13 @@ from app import config  # noqa: E402
 from app.main import app  # noqa: E402
 from app.model import MODEL_VERSION  # noqa: E402
 from app.runs import store  # noqa: E402
-from signal_config import CLASSES, NOT_CLASSIFIABLE, SAMPLES_PER_WINDOW, UNCERTAIN  # noqa: E402
+from signal_config import (  # noqa: E402
+    CLASSES,
+    FEATURE_NAMES,
+    NOT_CLASSIFIABLE,
+    SAMPLES_PER_WINDOW,
+    UNCERTAIN,
+)
 from spectrum_sense import generate_capture  # noqa: E402
 
 
@@ -76,6 +85,15 @@ class HealthTests(ApiTestCase):
         ):
             self.assertIn(path, paths)
 
+    def test_openapi_document_does_not_depend_on_the_python_version(self):
+        # Python 3.13 renamed these status phrases; CI regenerates the
+        # frontend's types on another Python than a developer may use, and
+        # fails if the documents differ.
+        text = self.client.get("/openapi.json").text
+        for phrase in ("Unprocessable Entity", "Unprocessable Content",
+                       "Request Entity Too Large", "Content Too Large"):
+            self.assertNotIn(phrase, text)
+
     def test_cors_allows_only_the_configured_origins(self):
         allowed = config.ALLOWED_ORIGINS[0]
         yes = self.client.get("/health", headers={"Origin": allowed})
@@ -120,6 +138,30 @@ class ExploreTests(ApiTestCase):
         for key in ("time", "constellation", "spectrum"):
             self.assertTrue(body["view"]["summaries"][key])
 
+    def test_every_decision_carries_its_evidence_and_possible_causes(self):
+        named = self.client.get("/explore", params={"signal": "BPSK", "snr": 12, "seed": 1}).json()["decision"]
+        refused = self.client.get("/explore", params={"signal": "BPSK", "snr": -2, "seed": 11}).json()["decision"]
+        for decision in (named, refused):
+            evidence = decision["evidence"]
+            self.assertEqual([item["name"] for item in evidence["features"]], list(FEATURE_NAMES))
+            self.assertAlmostEqual(sum(item["distance_share"] for item in evidence["features"]), 1.0, places=6)
+            self.assertAlmostEqual(evidence["distance"], decision["distance"], places=9)
+            self.assertIn(evidence["nearest_class"], CLASSES)
+            self.assertEqual(evidence["leading"], decision["leading"])
+            self.assertEqual(decision["causes"], [])
+        self.assertEqual(named["label"], "BPSK")
+        self.assertIn("does most to put BPSK ahead of", named["evidence"]["summary"])
+        self.assertEqual((refused["label"], refused["reason"]), (UNCERTAIN, "unlike the training data"))
+        self.assertIn("changing that alone would take the distance", refused["evidence"]["summary"])
+
+    def test_a_run_window_names_its_possible_causes(self):
+        run = self.client.post("/analyze/example").json()
+        number = next(w["number"] for w in run["windows"] if w["causes"] == ["power-step"])
+        decision = self.client.get(f"/runs/{run['run_id']}/windows/{number}").json()["decision"]
+        (cause,) = decision["causes"]
+        self.assertEqual(cause["key"], "power-step")
+        self.assertIn("dB above the quietest", cause["detail"])
+
     def test_unusable_values_fall_back_with_notes_and_never_echo_the_link(self):
         body = self.client.get(
             "/explore?signal=8PSK&snr=%5Bhere%5D(https://example.com)&offset=0.5&seed=1&seed=2&utm_source=mail"
@@ -156,8 +198,20 @@ class AnalyzeTests(ApiTestCase):
         self.assertEqual(body["recording"]["sample_rate"], real_example.SAMPLE_RATE)
         self.assertEqual(body["preparation"]["description"], "none")
         counts = {item["label"]: item["count"] for item in body["counts"]}
-        self.assertEqual(counts, {"noise": 0, "BPSK": 0, "QPSK": 8, UNCERTAIN: 22})
+        self.assertEqual(counts, {"noise": 0, "BPSK": 0, "QPSK": 0, UNCERTAIN: 30})
         self.assertEqual(len(body["windows"]), 30)
+        # The 20 windows that straddle a packet edge change power; the 10 inside
+        # a packet show no measured cause, and their evidence says where they lie.
+        self.assertEqual(
+            {item["key"]: item["count"] for item in body["cause_counts"]},
+            {"power-step": 20, "bare-carrier": 0, "center-component": 0},
+        )
+        self.assertEqual(
+            body["causes_summary"],
+            "Of the 30 uncertain windows, 20 change power within the window; "
+            "10 show no measured cause.",
+        )
+        self.assertEqual(sum(window["causes"] == ["power-step"] for window in body["windows"]), 20)
         self.assertEqual(body["windows"][0], {**body["windows"][0], "number": 1, "start_sample": 0})
         self.assertEqual(body["model_version"], MODEL_VERSION)
         self.assertIn("The timeline shows 30 windows", body["timeline_summary"])
@@ -270,6 +324,35 @@ class AnalyzeTests(ApiTestCase):
         data = b"0" * (config.MAX_UPLOAD_BYTES + 1)
         response = self.client.post("/analyze", files=[("files", ("big.cf32", data, "application/octet-stream"))])
         self.assertEqual(response.status_code, 413)
+
+    def test_a_large_content_length_is_refused_before_the_body_is_read(self):
+        data = b"0" * (2 * config.MAX_UPLOAD_BYTES)
+        with patch.object(MultiPartParser, "parse", side_effect=AssertionError("body was read")):
+            response = self.client.post(
+                "/analyze", files=[("files", ("big.cf32", data, "application/octet-stream"))]
+            )
+        self.assertEqual(response.status_code, 413)
+        self.assertIn(f"{config.MAX_UPLOAD_BYTES:,} bytes", response.json()["detail"])
+
+    def test_an_upload_without_a_content_length_is_411(self):
+        response = self.client.post(
+            "/analyze",
+            content=iter([b"--x\r\n"]),
+            headers={"content-type": "multipart/form-data; boundary=x"},
+        )
+        self.assertEqual(response.status_code, 411)
+
+    def test_uploads_under_the_limit_are_never_written_to_disk(self):
+        # Starlette moves a file part over its spool size to a temporary file.
+        samples = generate_capture("QPSK", np.random.default_rng(2), 40)[0].ravel()
+        data = iq_csv.to_csv(samples).encode()
+        self.assertGreater(len(data), 1024 * 1024)
+        self.assertLessEqual(len(data), config.MAX_UPLOAD_BYTES)
+        with patch.object(SpooledTemporaryFile, "rollover", side_effect=AssertionError("on disk")):
+            response = self.client.post(
+                "/analyze", files=[("files", ("big.csv", data, "text/csv"))]
+            )
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_run_cache_evicts_the_oldest(self):
         ids = [self.analyze_example()["run_id"] for _ in range(config.RUN_CACHE_SIZE + 1)]

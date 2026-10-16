@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import config, schemas
 from .model import MODEL_VERSION, get_demo_model, is_trained
 from .routers import analyze, example, explore, model
+from .uploads import UploadLimitMiddleware, keep_uploads_in_memory
 
 
 @asynccontextmanager
@@ -35,6 +36,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+keep_uploads_in_memory()
+app.add_middleware(UploadLimitMiddleware)
+# Added last, so it runs first: even a refused upload carries CORS headers
+# and the browser can show its message.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,

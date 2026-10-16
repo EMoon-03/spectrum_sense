@@ -137,8 +137,60 @@ def generate_probe_capture(
     return samples.reshape(windows, SAMPLES_PER_WINDOW)
 
 
+# line_strength refines every peak of the zero-padded spectrum within this
+# share of the highest one: a peak sampled off its top reads at most about
+# 2.6% low, so a lower peak cannot be the strongest line.
+LINE_CANDIDATE_SHARE = 0.97
+# Newton steps stop once a step moves the frequency less than this, in cycles
+# per sample over the window's length; the line's top is then exact to ~1e-12.
+_NEWTON_TOLERANCE = 1e-7
+_NEWTON_STEPS = 4
+
+
+def line_strength(x: np.ndarray) -> float:
+    """The strongest spectral line in x: the largest |mean(x * exp(-2j pi f k))|
+    over every frequency f, 1 for a constant and near 0 for white noise.
+
+    A spectrum zero-padded to four times the length finds the peaks; a
+    parabola through each peak's three bins estimates where its top lies,
+    and Newton steps on the exact spectrum move there. A plain FFT peak would
+    read up to 2.6% low when the line falls between bins, so the value would
+    change with a frequency shift; this one does not.
+    """
+    x = np.asarray(x, dtype=np.complex128)
+    n = len(x)
+    n_fft = 4 * n
+    coarse = np.abs(np.fft.fft(x, n_fft))
+    left, right = np.roll(coarse, 1), np.roll(coarse, -1)
+    highest = float(coarse.max())
+    peaks = np.flatnonzero(
+        (coarse >= left) & (coarse >= right) & (coarse >= LINE_CANDIDATE_SHARE * highest)
+    )
+    # Centered sample times keep the derivatives below well conditioned.
+    rate = -2j * np.pi * (np.arange(n) - (n - 1) / 2)
+    best = highest
+    for peak in peaks:
+        curve = left[peak] - 2 * coarse[peak] + right[peak]
+        frequency = (peak + (0.5 * (left[peak] - right[peak]) / curve if curve < 0 else 0.0)) / n_fft
+        turn = x * np.exp(rate * frequency)
+        for _ in range(_NEWTON_STEPS):
+            # Newton's method on |X(f)|^2, whose maximum is the line's top.
+            value, slope, bend = turn.sum(), (rate * turn).sum(), (rate**2 * turn).sum()
+            curvature = abs(slope) ** 2 + (np.conj(value) * bend).real
+            if curvature >= 0:
+                break
+            step = (np.conj(value) * slope).real / curvature
+            frequency -= step
+            turn = x * np.exp(rate * frequency)
+            if abs(step) * n < _NEWTON_TOLERANCE:
+                break
+        best = max(best, float(abs(turn.sum())))
+    return best / n
+
+
 def extract_features(window: np.ndarray) -> np.ndarray:
-    """Amplitude- and phase-invariant features of a finite, nonzero I/Q window.
+    """Amplitude-, phase-, and frequency-shift-invariant features of a finite,
+    nonzero I/Q window, in signal_config.FEATURES order.
 
     Invalid windows raise ValueError; the caller's samples are left unchanged.
     """
@@ -163,14 +215,18 @@ def extract_features(window: np.ndarray) -> np.ndarray:
     normalized /= np.sqrt(np.mean(np.abs(normalized) ** 2))
     window = normalized
 
-    n = len(window)
-    # Estimate carrier rotation from adjacent samples, then remove it. For pure
-    # noise this estimate is arbitrary, which is fine for this baseline.
+    power = np.mean(np.abs(window) ** 2)
+    amplitude = np.abs(window)
+    # A carrier offset f puts a spectral line at 2f in window**2 for BPSK and
+    # at 4f in window**4 for QPSK. Measuring the line wherever it lies needs no
+    # carrier estimate: an estimate off by half a thousandth of a cycle per
+    # sample turns window**2 a full cycle over 1,024 samples, and averaging it
+    # would wash the line out.
+    squared_line = line_strength(window**2)
+    fourth_line = line_strength(window**4)
+    # Correlation magnitudes ignore a constant carrier rotation, so none of
+    # the features below needs the carrier removed either.
     lag_one = np.mean(window[1:] * np.conj(window[:-1]))
-    freq_est = np.angle(lag_one) / (2 * np.pi)
-    x = window * np.exp(-2j * np.pi * freq_est * np.arange(n))
-    power = np.mean(np.abs(x) ** 2)
-    amplitude = np.abs(x)
     # Symbol-spaced phase differences distinguish binary from quadrature
     # phase transitions while discarding a constant carrier phase.
     symbol_difference = window[SAMPLES_PER_SYMBOL:] * np.conj(
@@ -178,13 +234,12 @@ def extract_features(window: np.ndarray) -> np.ndarray:
     )
     features = np.array(
         [
-            np.abs(np.mean(x**2)) / power,
-            np.abs(np.mean(x**4)) / power**2,
+            squared_line / power,
+            fourth_line / power**2,
             float(np.std(amplitude) / np.mean(amplitude)),
             float(np.mean(amplitude**4) / power**2),
             np.abs(lag_one) / power,
-            np.abs(np.mean(x[SAMPLES_PER_SYMBOL:] * np.conj(x[:-SAMPLES_PER_SYMBOL])))
-            / power,
+            np.abs(np.mean(symbol_difference)) / power,
             np.abs(np.mean(symbol_difference**2)) / power**2,
             np.abs(np.mean(symbol_difference**4)) / power**4,
         ],
@@ -325,6 +380,70 @@ def classify_features(
         for row, distance in zip(scores, distances)
     ]
     return scores, decisions
+
+
+@dataclass(frozen=True, eq=False)
+class FeatureEvidence:
+    """Where one window's features lie, feature by feature (FEATURE_NAMES order).
+
+    The distance shares split the squared distance to the nearest class
+    exactly: the offset from that class's mean is whitened with the symmetric
+    square root of its precision, which keeps each component as close as
+    possible to its own feature, and the squared components sum to the squared
+    distance. A feature can hold a large share with an ordinary-looking value
+    when the value disagrees with the window's other features, so each feature
+    also gets the value the nearest class's fit expects given the others, and
+    the distance the window would have if only that feature took it. Shares
+    say where the distance lies, not what caused it.
+    """
+
+    nearest: str  # the trained class the distance is measured to
+    leading: str  # the highest-scoring class
+    runner_up: str  # the second-highest-scoring class
+    distance: float  # to the nearest class, as novelty_distance measures it
+    values: np.ndarray  # the window's features
+    expected: np.ndarray  # each feature's value given the others, under the nearest class's fit
+    distance_shares: np.ndarray  # nonnegative; sum to 1 unless the distance is 0
+    distance_if_expected: np.ndarray  # the distance with only that feature changed to expected
+    score_push: np.ndarray  # log-odds each feature adds for leading over runner_up
+
+
+def explain_features(model: SignalClassifier, features: np.ndarray) -> FeatureEvidence:
+    """FeatureEvidence for one window's features. Explaining never changes a
+    decision: the same scaler, class fits, and coefficients are only read."""
+    features = np.asarray(features, dtype=float)
+    if features.ndim != 1:
+        raise ValueError("Provide the features of one window.")
+    scaler, logistic = model.pipeline[0], model.pipeline[-1]
+    standardized = scaler.transform(features[None, :])[0]
+    novelty = model.novelty
+    offsets = standardized[None, :] - novelty.means
+    squared = np.einsum("kd,kde,ke->k", offsets, novelty.precisions, offsets)
+    nearest = int(np.argmin(squared))
+    offset, precision = offsets[nearest], novelty.precisions[nearest]
+    total = max(float(squared[nearest]), 0.0)
+    eigenvalues, eigenvectors = np.linalg.eigh(precision)
+    root = (eigenvectors * np.sqrt(np.maximum(eigenvalues, 0.0))) @ eigenvectors.T
+    parts = (root @ offset) ** 2
+    # For a Gaussian fit, the value of feature i that best fits the others
+    # moves it by (P o)_i / P_ii, and lowers the squared distance by
+    # (P o)_i ** 2 / P_ii.
+    pulled, diagonal = precision @ offset, np.diag(precision)
+    expected = standardized - pulled / diagonal
+    remaining = np.maximum(total - pulled**2 / diagonal, 0.0)
+    scores = model.pipeline.predict_proba(features[None, :])[0]
+    leading, runner_up = (int(index) for index in np.argsort(scores)[::-1][:2])
+    return FeatureEvidence(
+        nearest=novelty.classes[nearest],
+        leading=model.classes[leading],
+        runner_up=model.classes[runner_up],
+        distance=float(np.sqrt(total)),
+        values=features,
+        expected=scaler.inverse_transform(expected[None, :])[0],
+        distance_shares=parts / parts.sum() if parts.sum() > 0 else np.zeros_like(parts),
+        distance_if_expected=np.sqrt(remaining),
+        score_push=(logistic.coef_[leading] - logistic.coef_[runner_up]) * standardized,
+    )
 
 
 def train_classifier(

@@ -38,8 +38,14 @@ from real_example import (
     SAMPLE_RATE,
     TITLE,
 )
-from signal_config import REASON_UNFAMILIAR, SAMPLES_PER_SYMBOL, SAMPLES_PER_WINDOW, UNCERTAIN
-from spectrum_sense import build_demo_model, classify_recording
+from signal_config import (
+    FEATURE_NAMES,
+    REASON_UNFAMILIAR,
+    SAMPLES_PER_SYMBOL,
+    SAMPLES_PER_WINDOW,
+    UNCERTAIN,
+)
+from spectrum_sense import build_demo_model, classify_recording, explain_features, extract_features
 
 
 BUILDER = Path(__file__).resolve().parents[1] / "tools" / "make_real_example.py"
@@ -219,13 +225,22 @@ class BundledFileTests(unittest.TestCase):
         self.assertGreater(len(mixed), len(inside))
         self.assertEqual({result.labels[i] for i in mixed}, {UNCERTAIN})
         self.assertEqual({result.reasons[i] for i in mixed}, {REASON_UNFAMILIAR})
-        self.assertIn("Windows that lie entirely inside a packet are mostly called QPSK", ABOUT)
-        inside_labels = [result.labels[i] for i in inside]
-        self.assertLessEqual(set(inside_labels), {"QPSK", UNCERTAIN})
-        self.assertGreater(inside_labels.count("QPSK"), len(inside) / 2)
-        self.assertIn("they come close to the distance limit", ABOUT)
-        distances = result.distances[inside]
-        self.assertGreater(float(np.median(distances)), 0.75 * model.distance_threshold)
+        self.assertIn('Windows that lie entirely inside a packet are answered "uncertain" too', ABOUT)
+        self.assertEqual({result.labels[i] for i in inside}, {UNCERTAIN})
+        self.assertEqual({result.reasons[i] for i in inside}, {REASON_UNFAMILIAR})
+        # "Their fourth-power line ... is about half as strong as the model's own
+        # QPSK would show": the evidence for each window inside a packet.
+        self.assertIn("is about half as strong as the model's own QPSK would show", ABOUT)
+        line = FEATURE_NAMES.index("fourth-power line")
+        samples = bundled_samples()
+        for index in inside:
+            start = result.starts[index]
+            features = extract_features(samples[start : start + SAMPLES_PER_WINDOW])
+            evidence = explain_features(model, features)
+            with self.subTest(window=index + 1):
+                self.assertEqual(evidence.nearest, "QPSK")
+                self.assertLess(evidence.values[line], 0.6 * evidence.expected[line])
+                self.assertGreater(evidence.distance_shares[line], 0.3)
 
     def test_preparing_the_excerpt_does_not_help(self):
         model = build_demo_model().model

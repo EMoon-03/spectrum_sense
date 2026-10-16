@@ -3,7 +3,9 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import DecisionBadge from "@/components/DecisionBadge";
+import EvidenceCard from "@/components/EvidenceCard";
 import Notice from "@/components/Notice";
+import PossibleCauses from "@/components/PossibleCauses";
 import PreparePanel from "@/components/PreparePanel";
 import ScoreBars from "@/components/ScoreBars";
 import SignalPlots from "@/components/SignalPlots";
@@ -231,6 +233,12 @@ export default function AnalyzePanel() {
               onSelect={setSelected}
               summary={result.timeline_summary}
             />
+            {result.counts.some((row) => row.label === "uncertain" && row.count > 0) && (
+              <p className="max-w-[80ch] text-sm leading-relaxed text-ink-muted">
+                <span className="text-ink">Possible causes.</span> {result.causes_summary} Choose a window
+                to see what was measured in it.
+              </p>
+            )}
 
             <div className="grid gap-4 md:grid-cols-[1fr_1fr]">
               <table className="border border-rule bg-surface text-sm">
@@ -315,6 +323,8 @@ export default function AnalyzePanel() {
                   <DecisionBadge decision={view.decision} />
                   <ScoreBars decision={view.decision} />
                 </div>
+                <PossibleCauses decision={view.decision} />
+                <EvidenceCard decision={view.decision} />
                 <SignalPlots view={view.view} />
               </>
             )}

@@ -10,6 +10,7 @@ from spectrum_sense import (
     SAMPLES_PER_WINDOW,
     extract_features,
     generate_capture,
+    line_strength,
 )
 
 
@@ -110,6 +111,51 @@ class FeatureExtractionTests(unittest.TestCase):
                 self.extract_checked(window)
                 np.testing.assert_array_equal(window, original)
                 self.assertEqual(window.flags.writeable, writable)
+
+    def test_each_line_feature_sees_the_signal_it_is_for(self):
+        # Squaring BPSK, or raising QPSK to the fourth power, leaves a spectral
+        # line wherever the carrier offset puts it. An earlier version removed
+        # an estimated carrier and averaged, which washed the line out: the
+        # median clean QPSK window scored 0.04 on the fourth-power line.
+        def median(label):
+            rng = np.random.default_rng(14)
+            rows = [
+                extract_features(generate_capture(
+                    label, rng, 1, snr_db_override=14, freq_offset_override=0.006
+                )[0][0])
+                for _ in range(30)
+            ]
+            return np.median(rows, axis=0)
+
+        bpsk, qpsk, noise = median("BPSK"), median("QPSK"), median("noise")
+        self.assertGreater(bpsk[0], 0.9)  # squared-signal line
+        self.assertGreater(bpsk[1], 0.85)  # fourth-power line
+        self.assertGreater(qpsk[1], 0.85)
+        self.assertLess(qpsk[0], 0.3)
+        self.assertLess(noise[0], 0.3)
+        self.assertLess(noise[1], 0.6)
+
+    def test_line_strength_is_exact_wherever_the_line_lies(self):
+        k = np.arange(SAMPLES_PER_WINDOW)
+        for frequency in (0.0, 0.1234567, -0.3999, 0.49, 0.5, 1 / 3):
+            with self.subTest(frequency=frequency):
+                self.assertAlmostEqual(line_strength(np.exp(2j * np.pi * frequency * k)), 1.0, places=10)
+        # Half the power in a line: the strength is the line's share of amplitude.
+        rng = np.random.default_rng(3)
+        noise = (rng.standard_normal(SAMPLES_PER_WINDOW) + 1j * rng.standard_normal(SAMPLES_PER_WINDOW)) / 2
+        tone = 0.5 * np.exp(2j * np.pi * 0.2071 * k)
+        self.assertAlmostEqual(line_strength(tone + noise * 0.01), 0.5, delta=0.01)
+
+    def test_a_frequency_shift_changes_no_feature(self):
+        k = np.arange(SAMPLES_PER_WINDOW)
+        for label in CLASSES:
+            window = generate_capture(label, np.random.default_rng(21), 1)[0][0]
+            for shift in (0.2, -0.137, 0.0003):
+                with self.subTest(label=label, shift=shift):
+                    np.testing.assert_allclose(
+                        extract_features(window * np.exp(2j * np.pi * shift * k)),
+                        extract_features(window), rtol=1e-9, atol=1e-12,
+                    )
 
     def test_generated_captures_for_each_class_have_finite_features(self):
         rng = np.random.default_rng(42)
